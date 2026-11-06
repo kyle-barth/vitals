@@ -1,5 +1,5 @@
-# Link the C runtime statically so the exe has no vcruntime DLL dependency.
-# This keeps it self-contained, and means the elevated helper never resolves
-# a runtime DLL from a user-writable folder such as Downloads.
+# Link the C runtime statically so the exe has no vcruntime DLL dependency and
+# runs on a clean PC. See build.rs for how system DLLs are kept out of reach of
+# files planted beside the exe.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

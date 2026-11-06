@@ -51,6 +51,66 @@ const MIN_SIZE: (i32, i32) = (190, 36);
 const EDGE: f32 = 5.0;
 const TOP_EDGE: f32 = 3.0;
 
+/// Win32 calls that send messages straight back to this window. Making one while
+/// holding `&mut App` would re-enter `window_proc` and create a second `&mut App`,
+/// which is undefined behaviour, so they wait in `App::pending` until the borrow
+/// has ended.
+enum Deferred {
+    SetTitle(HSTRING),
+    Show(SHOW_WINDOW_CMD),
+    Pin { on_top: bool },
+    Place(RECT),
+    TitleBarTheme { dark: bool },
+}
+
+impl Deferred {
+    fn run(self, hwnd: HWND) {
+        // SAFETY: the handle is this window's own, and every pointer passed
+        // outlives its call. A failure here only leaves the window as it was.
+        unsafe {
+            match self {
+                Deferred::SetTitle(title) => {
+                    let _ = SetWindowTextW(hwnd, &title);
+                }
+                Deferred::Show(command) => {
+                    let _ = ShowWindow(hwnd, command);
+                }
+                Deferred::Pin { on_top } => {
+                    let order = if on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+                    let _ = SetWindowPos(hwnd, Some(order), 0, 0, 0, 0, flags);
+                }
+                Deferred::Place(r) => {
+                    let (width, height) = (r.right - r.left, r.bottom - r.top);
+                    let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+                    let _ = SetWindowPos(hwnd, None, r.left, r.top, width, height, flags);
+                }
+                Deferred::TitleBarTheme { dark } => {
+                    let value = i32::from(dark);
+                    let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        (&raw const value).cast(),
+                        size_of::<i32>() as u32,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Runs the deferred calls.
+///
+/// # Safety
+/// `app` must be valid, and no reference to the `App` may be live.
+unsafe fn run_deferred(app: *mut App, hwnd: HWND) {
+    // SAFETY: the caller guarantees this, and the borrow ends with the statement.
+    let pending = unsafe { std::mem::take(&mut (*app).pending) };
+    for action in pending {
+        action.run(hwnd);
+    }
+}
+
 struct App {
     hwnd: HWND,
     gfx: Gfx,
@@ -63,6 +123,7 @@ struct App {
     dark: bool,
     hover: Hover,
     title: String,
+    pending: Vec<Deferred>,
 }
 
 impl App {
@@ -113,10 +174,8 @@ impl App {
             |text| format!("{text} - {APP_TITLE}"),
         );
         if title != self.title {
-            // SAFETY: the handle is valid and the string outlives the call.
-            unsafe {
-                let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title.as_str()));
-            }
+            self.pending
+                .push(Deferred::SetTitle(HSTRING::from(title.as_str())));
             self.title = title;
         }
 
@@ -226,50 +285,30 @@ impl App {
     }
 
     fn press(&mut self, button: Button) {
-        // SAFETY: the handle is valid for as long as `App` exists.
-        unsafe {
-            match button {
-                Button::Close => {
-                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                }
-                Button::Minimize => {
-                    let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
-                }
-                Button::Maximize => {
-                    let command = if IsZoomed(self.hwnd).as_bool() {
-                        SW_RESTORE
-                    } else {
-                        SW_MAXIMIZE
-                    };
-                    let _ = ShowWindow(self.hwnd, command);
-                }
-                Button::Pin => {
-                    self.settings.always_on_top = !self.settings.always_on_top;
-                    self.apply_pin();
-                    self.invalidate();
-                }
+        match button {
+            Button::Close => {
+                // SAFETY: the handle is valid for as long as `App` exists.
+                let _ = unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
+            Button::Minimize => self.pending.push(Deferred::Show(SW_MINIMIZE)),
+            Button::Maximize => {
+                // SAFETY: the handle is valid for as long as `App` exists.
+                let maximized = unsafe { IsZoomed(self.hwnd) }.as_bool();
+                let command = if maximized { SW_RESTORE } else { SW_MAXIMIZE };
+                self.pending.push(Deferred::Show(command));
+            }
+            Button::Pin => {
+                self.settings.always_on_top = !self.settings.always_on_top;
+                self.queue_pin();
+                self.invalidate();
             }
         }
     }
 
-    fn apply_pin(&self) {
-        let order = if self.settings.always_on_top {
-            HWND_TOPMOST
-        } else {
-            HWND_NOTOPMOST
-        };
-        // SAFETY: the handle is valid for as long as `App` exists.
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(order),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
+    fn queue_pin(&mut self) {
+        self.pending.push(Deferred::Pin {
+            on_top: self.settings.always_on_top,
+        });
     }
 
     fn click(&mut self, x: f32, y: f32) {
@@ -309,16 +348,8 @@ impl App {
 
     fn apply_theme(&mut self) {
         self.dark = system_uses_dark_mode();
-        let value = i32::from(self.dark);
-        // SAFETY: the attribute value is valid for the size given.
-        unsafe {
-            let _ = DwmSetWindowAttribute(
-                self.hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                (&raw const value).cast(),
-                size_of::<i32>() as u32,
-            );
-        }
+        self.pending
+            .push(Deferred::TitleBarTheme { dark: self.dark });
         self.invalidate();
     }
 }
@@ -354,15 +385,32 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // SAFETY: the pointer is stored once, straight after creation, and is
-    // cleared before the `App` is freed. Everything runs on the UI thread.
-    let app = unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App).as_mut() };
-    if let Some(app) = app {
-        if let Some(result) = handle(app, message, wparam, lparam) {
+    // SAFETY: reads a value this window stores for itself.
+    let app = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+    if app.is_null() {
+        if message == WM_NCCALCSIZE && wparam.0 != 0 {
+            return LRESULT(0);
+        }
+    } else if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        // SAFETY: Begin and End are paired on this window. BeginPaint can send
+        // WM_ERASEBKGND, so the `App` is only touched once it has returned.
+        unsafe {
+            BeginPaint(hwnd, &mut paint);
+            (*app).paint();
+            let _ = EndPaint(hwnd, &paint);
+        }
+        return LRESULT(0);
+    } else {
+        // SAFETY: the pointer is stored once, straight after creation, and is
+        // cleared before the `App` is freed. Everything runs on the UI thread,
+        // and this borrow ends before anything can re-enter this function.
+        let result = handle(unsafe { &mut *app }, message, wparam, lparam);
+        // SAFETY: the borrow above has ended.
+        unsafe { run_deferred(app, hwnd) };
+        if let Some(result) = result {
             return result;
         }
-    } else if message == WM_NCCALCSIZE && wparam.0 != 0 {
-        return LRESULT(0);
     }
     // SAFETY: forwards this window's own message unchanged.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -395,16 +443,6 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
         }
         WM_NCHITTEST => return Some(LRESULT(app.hit_test(lparam) as isize)),
         WM_ERASEBKGND => return Some(LRESULT(1)),
-        WM_PAINT => {
-            let mut paint = PAINTSTRUCT::default();
-            // SAFETY: Begin and End are paired on this window.
-            unsafe {
-                BeginPaint(hwnd, &mut paint);
-                app.paint();
-                let _ = EndPaint(hwnd, &paint);
-            }
-            return Some(LRESULT(0));
-        }
         WM_SIZE => {
             let (width, height) = (
                 (lparam.0 & 0xffff) as u32,
@@ -433,18 +471,8 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
             let dpi = (wparam.0 & 0xffff) as f32;
             app.gfx.set_dpi(dpi);
             // SAFETY: for this message, `lparam` points to the suggested rectangle.
-            unsafe {
-                let r = &*(lparam.0 as *const RECT);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+            let suggested = unsafe { *(lparam.0 as *const RECT) };
+            app.pending.push(Deferred::Place(suggested));
             return Some(LRESULT(0));
         }
         WM_MOUSEMOVE => {
@@ -617,10 +645,12 @@ pub fn run() -> Result<()> {
             dark: system_uses_dark_mode(),
             hover: Hover::default(),
             title: APP_TITLE.to_string(),
+            pending: Vec::new(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();
-        (*app).apply_pin();
+        (*app).queue_pin();
+        run_deferred(app, hwnd);
 
         // Recalculate the frame now that WM_NCCALCSIZE reaches `App`.
         SetWindowPos(

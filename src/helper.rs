@@ -21,17 +21,17 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
-    OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile, SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT,
-    WriteFile,
+    FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile, SECURITY_ANONYMOUS,
+    SECURITY_SQOS_PRESENT, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcessId, GetExitCodeProcess, INFINITE, WaitForMultipleObjects,
-    WaitForSingleObject,
+    CreateEventW, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, INFINITE,
+    WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -54,9 +54,17 @@ const STALE_AFTER: Duration = Duration::from_secs(5);
 /// How long AMD's library may fail before the helper gives up.
 const MAX_FAILURES: u32 = 10;
 
+/// This value comes from an elevated process's command line, so it is checked
+/// strictly. A prefix check alone would pass `\\.\pipe\vitals-\..\..\C:\file`,
+/// which Windows resolves to an ordinary file.
+fn is_valid_pipe_name(name: &str) -> bool {
+    name.strip_prefix(PIPE_PREFIX)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Runs the elevated helper until the UI closes the pipe. Returns the exit code.
 pub fn run(pipe_name: &str) -> i32 {
-    if !pipe_name.starts_with(PIPE_PREFIX) {
+    if !is_valid_pipe_name(pipe_name) {
         return EXIT_BAD_ARGUMENT;
     }
     let Some(ryzen) = RyzenMaster::load() else {
@@ -78,6 +86,10 @@ pub fn run(pipe_name: &str) -> i32 {
         )
     };
     let Ok(pipe) = pipe else { return EXIT_OK };
+    // SAFETY: the handle was opened just above.
+    if unsafe { GetFileType(pipe) } != FILE_TYPE_PIPE {
+        return EXIT_BAD_ARGUMENT;
+    }
 
     let mut failures = 0;
     loop {
@@ -220,9 +232,20 @@ impl CoreLink {
                 let wait = WaitForMultipleObjects(&[event, process], false, CONNECT_TIMEOUT_MS);
                 if wait != WAIT_OBJECT_0 {
                     let _ = CancelIoEx(pipe, Some(&overlapped));
+                    // Windows keeps using `overlapped` until the cancel completes.
+                    let mut ignored = 0u32;
+                    let _ = GetOverlappedResult(pipe, &overlapped, &mut ignored, true);
                     return exit_status(process);
                 }
             } else if connect.is_err() && error != ERROR_PIPE_CONNECTED {
+                return CoreStatus::Unavailable;
+            }
+
+            // Only accept the process this link started, so another program
+            // cannot connect first and feed the UI false temperatures.
+            let mut client = 0u32;
+            let connected = GetNamedPipeClientProcessId(pipe, &mut client).is_ok();
+            if !connected || client == 0 || client != GetProcessId(process) {
                 return CoreStatus::Unavailable;
             }
 
@@ -303,5 +326,22 @@ mod tests {
         assert_eq!(run(r"\\.\pipe\something-else"), EXIT_BAD_ARGUMENT);
         assert_eq!(run(r"C:\file.txt"), EXIT_BAD_ARGUMENT);
         assert_eq!(run(""), EXIT_BAD_ARGUMENT);
+    }
+
+    #[test]
+    fn helper_refuses_a_path_that_escapes_the_pipe_namespace() {
+        assert_eq!(
+            run(r"\\.\pipe\vitals-\..\..\C:\Windows\win.ini"),
+            EXIT_BAD_ARGUMENT
+        );
+        assert!(!is_valid_pipe_name(r"\\.\pipe\vitals-123\..\..\C:\file"));
+    }
+
+    #[test]
+    fn pipe_names_must_end_in_a_process_id() {
+        assert!(is_valid_pipe_name(r"\\.\pipe\vitals-20616"));
+        assert!(!is_valid_pipe_name(r"\\.\pipe\vitals-"));
+        assert!(!is_valid_pipe_name(r"\\.\pipe\vitals-12a"));
+        assert!(!is_valid_pipe_name(r"\\.\pipe\vitals--1"));
     }
 }
