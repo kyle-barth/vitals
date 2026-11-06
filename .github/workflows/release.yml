@@ -53,7 +53,8 @@ jobs:
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/vitals.exe dist/
           $hash = (Get-FileHash dist/vitals.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  vitals.exe" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          # Written with a Unix line ending so that sha256sum -c works on any platform.
+          [IO.File]::WriteAllText("dist/SHA256SUMS.txt", "$hash  vitals.exe`n")
 
           $pattern = "(?ms)^## \[$([regex]::Escape($env:VERSION))\][^\n]*\n(.*?)(?=^## \[|\z)"
           $changes = [regex]::Match((Get-Content CHANGELOG.md -Raw), $pattern).Groups[1].Value.Trim()
