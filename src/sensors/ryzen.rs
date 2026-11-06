@@ -20,7 +20,7 @@ use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-use windows::core::{HSTRING, s};
+use windows::core::{HSTRING, s, w};
 
 const OFFSET_PACKAGE_LIMIT: usize = 0x10;
 const OFFSET_PACKAGE_POWER: usize = 0x14;
@@ -74,6 +74,13 @@ impl RyzenMaster {
             let root = folder.to_string();
             CoTaskMemFree(Some(folder.0 as *const _));
             let path = HSTRING::from(format!(r"{}\AMD\CNext\CNext\Platform.dll", root.ok()?));
+
+            // AMD's library calls NetWkstaGetInfo and gives up if it fails.
+            // Windows loads wkscli.dll for that call on first use, and that
+            // load fails with ERROR_INVALID_PARAMETER once `main` has restricted
+            // the DLL search. Loading it here first means it is never attempted.
+            let _ = LoadLibraryExW(w!("wkscli.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32);
+
             let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
             let module = LoadLibraryExW(&path, None, flags).ok()?;
             let read: ReadParameters = transmute(GetProcAddress(module, s!("GetRmCpuParameters"))?);
