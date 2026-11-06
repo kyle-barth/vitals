@@ -1,5 +1,6 @@
 //! The set of things Vitals tracks, and the state kept for each one.
 
+use crate::apps::BusyApp;
 use crate::history::Series;
 use crate::severity::{Limits, Severity};
 
@@ -196,6 +197,7 @@ pub struct Snapshot {
     pub vram_total_gb: Option<f32>,
     pub threads: Vec<f32>,
     pub core: CoreStatus,
+    pub apps: Vec<BusyApp>,
 }
 
 impl Default for Snapshot {
@@ -206,6 +208,7 @@ impl Default for Snapshot {
             vram_total_gb: None,
             threads: Vec::new(),
             core: CoreStatus::Off,
+            apps: Vec::new(),
         }
     }
 }
@@ -248,6 +251,7 @@ pub struct Monitor {
     pub vram_total_gb: Option<f32>,
     pub threads: Vec<f32>,
     pub core: CoreStatus,
+    pub apps: Vec<BusyApp>,
 }
 
 impl Monitor {
@@ -275,6 +279,7 @@ impl Monitor {
         self.vram_total_gb = snapshot.vram_total_gb.or(self.vram_total_gb);
         self.threads = snapshot.threads;
         self.core = snapshot.core;
+        self.apps = snapshot.apps;
     }
 
     pub fn reset_peak(&mut self, id: MetricId) {

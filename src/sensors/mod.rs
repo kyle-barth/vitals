@@ -3,6 +3,7 @@
 
 pub mod adl;
 pub mod pdh;
+pub mod processes;
 pub mod ryzen;
 pub mod system;
 
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::apps::Capacity;
 use crate::helper::CoreLink;
 use crate::metrics::{CoreStatus, MetricId, Snapshot};
 
@@ -69,6 +71,7 @@ struct Sources {
     base_mhz: Option<f32>,
     vram_total_gb: Option<f32>,
     smoothed_power: Option<f32>,
+    processes: processes::ProcessSource,
 }
 
 impl Sources {
@@ -79,6 +82,7 @@ impl Sources {
             base_mhz: system::base_clock_mhz(),
             vram_total_gb: system::video_memory_gb(),
             smoothed_power: None,
+            processes: processes::ProcessSource::new(),
         }
     }
 
@@ -138,6 +142,17 @@ impl Sources {
             }
             None => s.set(MetricId::CpuPower, self.smoothed_power),
         }
+
+        let capacity = Capacity {
+            memory_gb: s.ram_total_gb.unwrap_or(0.0),
+            video_memory_gb: self.vram_total_gb.unwrap_or(0.0),
+        };
+        let vram_percent = gpu
+            .vram_used_mb
+            .zip(self.vram_total_gb)
+            .map_or(0.0, |(used, total)| used / MB_PER_GB / total * 100.0);
+        let gpu_busy = crate::apps::gpu_could_be_busy(gpu.load.unwrap_or(0.0), vram_percent);
+        s.apps = self.processes.busy_apps(gpu_busy, capacity);
         s
     }
 }

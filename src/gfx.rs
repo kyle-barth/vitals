@@ -6,29 +6,32 @@ use std::collections::HashMap;
 
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW,
-    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_FACTORY_OPTIONS,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_FACTORY_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_LINE_JOIN_ROUND, D2D1_PRESENT_OPTIONS_IMMEDIATELY,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory,
     ID2D1HwndRenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_TEXT_ALIGNMENT,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
+    IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::core::{Result, w};
 use windows_numerics::Vector2;
 
+use crate::apps::Icon;
 use crate::layout::Rect;
 
 /// Segoe UI's ascent and cap height, as fractions of the font size.
@@ -89,6 +92,7 @@ pub enum Weight {
 pub enum Align {
     Left,
     Right,
+    Center,
 }
 
 /// Text formats are cached by half-pixel size, which bounds the cache however
@@ -103,6 +107,8 @@ struct FormatKey {
 struct Target {
     render: ID2D1HwndRenderTarget,
     brush: ID2D1SolidColorBrush,
+    /// Bitmaps belong to their render target, so they are dropped along with it.
+    icons: RefCell<HashMap<String, ID2D1Bitmap>>,
 }
 
 pub struct Gfx {
@@ -198,7 +204,11 @@ impl Gfx {
             };
             let render = self.factory.CreateHwndRenderTarget(&properties, &window)?;
             let brush = render.CreateSolidColorBrush(&Color::rgb(0).d2d(), None)?;
-            self.target = Some(Target { render, brush });
+            self.target = Some(Target {
+                render,
+                brush,
+                icons: RefCell::default(),
+            });
         }
         Ok(())
     }
@@ -301,6 +311,66 @@ impl Canvas<'_> {
         };
     }
 
+    /// Draws an app's icon, keeping it as a bitmap under `key` for later frames.
+    pub fn icon(&self, key: &str, icon: &Icon, r: Rect) {
+        let mut icons = self.target.icons.borrow_mut();
+        if !icons.contains_key(key) {
+            let properties = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            let size = D2D_SIZE_U {
+                width: icon.size,
+                height: icon.size,
+            };
+            // SAFETY: the pixels hold `size` rows of `size * 4` bytes, and
+            // Direct2D copies them during the call.
+            let created = unsafe {
+                self.target.render.CreateBitmap(
+                    size,
+                    Some(icon.pixels.as_ptr().cast()),
+                    icon.size * 4,
+                    &properties,
+                )
+            };
+            let Ok(bitmap) = created else { return };
+            icons.insert(key.to_string(), bitmap);
+        }
+        if let Some(bitmap) = icons.get(key) {
+            // SAFETY: called between BeginDraw and EndDraw, and the bitmap was
+            // created on this target.
+            unsafe {
+                self.target.render.DrawBitmap(
+                    bitmap,
+                    Some(&d2d_rect(r)),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Shortens `text` with an ellipsis until it fits in `width`.
+    pub fn fit(&self, text: &str, size: f32, weight: Weight, width: f32) -> String {
+        if self.measure(text, size, weight) <= width {
+            return text.to_string();
+        }
+        let mut kept: Vec<char> = text.chars().collect();
+        while !kept.is_empty() {
+            kept.pop();
+            let candidate: String = kept.iter().chain(['…'].iter()).collect();
+            if self.measure(&candidate, size, weight) <= width {
+                return candidate;
+            }
+        }
+        String::new()
+    }
+
     pub fn line(&self, from: (f32, f32), to: (f32, f32), width: f32, color: Color) {
         let point = |(x, y): (f32, f32)| Vector2 { X: x, Y: y };
         // SAFETY: called between BeginDraw and EndDraw, and the stroke style
@@ -364,6 +434,7 @@ impl Canvas<'_> {
         let alignment: DWRITE_TEXT_ALIGNMENT = match align {
             Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
             Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
         };
         // SAFETY: the font name and locale are valid static strings.
         let format = unsafe {
@@ -428,6 +499,7 @@ impl Canvas<'_> {
         let (left, right) = match align {
             Align::Left => (x, x + FAR),
             Align::Right => (x - FAR, x),
+            Align::Center => (x - FAR, x + FAR),
         };
         let area = D2D_RECT_F {
             left,

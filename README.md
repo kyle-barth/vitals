@@ -2,7 +2,7 @@
 
 A small, fully resizable sensor monitor for Windows, written in Rust with
 Direct2D. It tracks CPU and GPU temperatures, load, power, memory, disk and
-network in a single 360 KB exe with no runtime dependencies.
+network in a single 450 KB exe with no runtime dependencies.
 
 <p align="center">
   <img src="docs/images/default.png" width="340" alt="Vitals at its default size: a grid of tiles showing CPU and GPU temperature, memory, GPU hotspot, load and power, each with a live sparkline">
@@ -56,6 +56,45 @@ The window adapts to whatever size you give it:
 They are set in `MetricId::spec` in `src/metrics.rs`. Severity drops back only
 once a value is 3° below the threshold, so it does not flicker.
 
+## Busy apps
+
+A short list appears along the bottom of the window when an app is using a lot.
+On a calm PC there is no list, and the window looks exactly as it always does.
+The tiles shrink to make room, and at most three rows are shown, or six side by
+side in a wide window. A one-line strip keeps its numbers, and a taller strip
+puts the app on its second line.
+
+| Resource | An app is listed from |
+| --- | --- |
+| CPU | 25% of the whole CPU |
+| GPU | 25% load |
+| Memory | 20% of your RAM |
+| Video memory | 25% of your VRAM |
+| Not responding | Always, however little it is using |
+
+An app must hold a limit for 5 seconds to appear, and leaves 10 seconds after
+dropping back, so a brief spike never moves the window around. Rows stay in the
+order they appeared, so an End button can't shift under your pointer. These
+limits are at the top of `src/apps.rs`.
+
+Processes are grouped by exe, so a browser's many processes count as one app,
+and its usage is added together.
+
+### Ending an app
+
+Hover a row to reveal **End**, then confirm. Pressing Keep, clicking elsewhere or
+pressing Esc cancels, and the question goes away by itself after 10 seconds.
+
+- **End is immediate.** Every process of that app stops at once, as with End task
+  in Task Manager, and unsaved work is lost.
+- **A frozen app** shows End straight away, and also reaches the taskbar text. Its
+  CPU use is shown too: Windows also calls an app "not responding" when it is only
+  busy, so one still using CPU may recover if you wait, while 0% suggests it is stuck.
+- **Apps running as administrator** can't be ended, because Vitals runs without
+  admin rights. The row says "Needs admin to end".
+- **Windows' own processes** can appear if they get busy, but never offer End,
+  because ending one could take down the desktop.
+
 ## CPU temperature
 
 Windows has no standard API for CPU temperature, so Vitals reads what AMD
@@ -107,10 +146,10 @@ Measured at the default size while a game was running:
 
 | | |
 | --- | --- |
-| Exe size | 358 KB |
+| Exe size | 446 KB |
 | Smallest window | 190 × 36 |
-| CPU | 0.3% of one thread, or 0.02% of a 16-thread CPU |
-| Memory | 33 MB working set, 15 MB private |
+| CPU | 0.6% of one thread, or 0.04% of a 16-thread CPU |
+| Memory | 38 MB working set, 16 MB private |
 | Repaint during live resize | 8.8 ms |
 
 Memory rises after resizing to very large windows, then settles at about 45 MB
@@ -169,7 +208,8 @@ if `CHANGELOG.md` has no section for that version.
 | `src/gfx.rs` | A thin Direct2D and DirectWrite layer |
 | `src/metrics.rs` | What is tracked, and its state |
 | `src/severity.rs`, `src/history.rs` | Status rules and fixed-size history |
-| `src/sensors/` | The sampler thread, and ADL, PDH and Ryzen Master access |
+| `src/apps.rs` | Which apps are busy enough to show, and in what order |
+| `src/sensors/` | The sampler thread, and process, ADL, PDH and Ryzen Master access |
 | `src/helper.rs` | The elevated helper and the UI's link to it |
 | `src/settings.rs` | Saved preferences |
 | `designs/` | The original HTML design directions |

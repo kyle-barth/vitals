@@ -25,7 +25,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
+    TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, Result, w};
@@ -34,6 +34,7 @@ use crate::gfx::Gfx;
 use crate::helper::CoreLink;
 use crate::layout::{self, Button, Layout, Mode, TITLE_H};
 use crate::metrics::{CoreStatus, MetricId, Monitor};
+use crate::sensors::processes::{EndOutcome, end_app};
 use crate::sensors::{Latest, Sampler};
 use crate::settings::Settings;
 use crate::ui::{self, DARK, Hover, LIGHT, View};
@@ -42,6 +43,12 @@ const CLASS_NAME: PCWSTR = w!("Vitals.Window");
 const INSTANCE_MUTEX: PCWSTR = w!("Local\\Vitals.SingleInstance");
 const APP_TITLE: &str = "Vitals";
 const WM_APP_SAMPLE: u32 = WM_APP + 1;
+const WM_APP_ENDED: u32 = WM_APP + 2;
+/// Samples before an unanswered End question goes away by itself.
+const CONFIRM_SAMPLES: u32 = 10;
+/// Samples that a message stays on an app's row.
+const NOTICE_SAMPLES: u32 = 6;
+const NEEDS_ADMIN: &str = "Needs admin to end";
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_NCMOUSELEAVE: u32 = 0x02A2;
 const BASE_DPI: f32 = 96.0;
@@ -124,6 +131,12 @@ struct App {
     hover: Hover,
     title: String,
     pending: Vec<Deferred>,
+    /// The app being asked about before it is ended, and for how many samples.
+    confirm: Option<(String, u32)>,
+    /// A message on one app's row: its key, the text, and samples left to show.
+    notice: Option<(String, &'static str, u32)>,
+    /// The last End request's result, set by its background thread.
+    ended: Arc<Mutex<Option<(String, EndOutcome)>>>,
 }
 
 impl App {
@@ -134,7 +147,25 @@ impl App {
 
     fn relayout(&mut self, width_px: u32, height_px: u32) {
         let scale = self.scale();
-        self.layout = layout::compute(width_px as f32 / scale, height_px as f32 / scale);
+        let (apps, frozen) = self.app_counts();
+        self.layout = layout::compute(
+            width_px as f32 / scale,
+            height_px as f32 / scale,
+            apps,
+            frozen,
+        );
+    }
+
+    fn app_counts(&self) -> (usize, bool) {
+        let apps = &self.monitor.apps;
+        (apps.len(), apps.iter().any(|a| a.frozen))
+    }
+
+    /// Fits the layout to the current window, after the list of apps changes.
+    fn refresh_layout(&mut self) {
+        let scale = self.scale();
+        let (width, height) = (self.layout.width, self.layout.height);
+        self.relayout((width * scale) as u32, (height * scale) as u32);
     }
 
     fn invalidate(&self) {
@@ -152,6 +183,11 @@ impl App {
             theme,
             hover: self.hover,
             pinned: self.settings.always_on_top,
+            confirm: self.confirm.as_ref().map(|(key, _)| key.as_str()),
+            notice: self
+                .notice
+                .as_ref()
+                .map(|(key, text, _)| (key.as_str(), *text)),
         };
         let _ = self.gfx.draw(|canvas| ui::paint(canvas, &view));
     }
@@ -160,7 +196,12 @@ impl App {
     fn on_sample(&mut self) {
         let snapshot = self.latest.lock().ok().and_then(|mut slot| slot.take());
         let Some(snapshot) = snapshot else { return };
+        let before = self.app_counts();
         self.monitor.update(snapshot);
+        if self.app_counts() != before {
+            self.refresh_layout();
+        }
+        self.age_app_messages();
 
         // Declining the prompt is a clear answer, so don't ask at every launch.
         if self.monitor.core == CoreStatus::Declined {
@@ -168,7 +209,10 @@ impl App {
         }
 
         // The title reaches the taskbar, so an alert shows even when covered.
-        let alert = ui::alert_text(&self.layout, &self.monitor);
+        let frozen = self.monitor.apps.iter().find(|a| a.frozen);
+        let alert = frozen
+            .map(|app| format!("{} not responding", app.name))
+            .or_else(|| ui::alert_text(&self.layout, &self.monitor));
         let title = alert.map_or_else(
             || APP_TITLE.to_string(),
             |text| format!("{text} - {APP_TITLE}"),
@@ -182,6 +226,111 @@ impl App {
         // SAFETY: the handle is valid for as long as `App` exists.
         if !unsafe { IsIconic(self.hwnd) }.as_bool() {
             self.invalidate();
+        }
+    }
+
+    /// Drops the End question if its app has gone or it has been left too long,
+    /// so an old question can't sit waiting for a stray click.
+    fn age_app_messages(&mut self) {
+        let apps = &self.monitor.apps;
+        if let Some((key, age)) = &mut self.confirm {
+            *age += 1;
+            if *age >= CONFIRM_SAMPLES || !apps.iter().any(|a| a.key == *key) {
+                self.confirm = None;
+            }
+        }
+        if let Some((_, _, left)) = &mut self.notice {
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                self.notice = None;
+            }
+        }
+    }
+
+    /// Ends every process of an app, away from the UI thread.
+    fn end_app(&mut self, index: usize) {
+        let Some(app) = self.monitor.apps.get(index) else {
+            return;
+        };
+        let (key, processes) = (app.key.clone(), app.processes.clone());
+        let (result, target) = (self.ended.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let outcome = end_app(&processes);
+            if let Ok(mut slot) = result.lock() {
+                *slot = Some((key, outcome));
+            }
+            // SAFETY: posting to a window that has gone simply fails.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_ENDED,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        });
+    }
+
+    fn on_ended(&mut self) {
+        let result = self.ended.lock().ok().and_then(|mut slot| slot.take());
+        if let Some((key, EndOutcome::NeedsAdmin)) = result {
+            self.notice = Some((key, NEEDS_ADMIN, NOTICE_SAMPLES));
+            self.invalidate();
+        }
+    }
+
+    /// Handles a click on or away from the busy list. Returns true if it used it.
+    fn click_app(&mut self, x: f32, y: f32) -> bool {
+        let Some(index) = self.layout.app_at(x, y) else {
+            // Clicking anywhere else is a clear "no".
+            let had_question = self.confirm.take().is_some();
+            if had_question {
+                self.invalidate();
+            }
+            return had_question;
+        };
+        let row = self.layout.app_rows[index];
+        let Some(app) = self.monitor.apps.get(index) else {
+            return true;
+        };
+        let asking = self
+            .confirm
+            .as_ref()
+            .is_some_and(|(key, _)| *key == app.key);
+        if asking {
+            let (end, keep) = layout::confirm_buttons(row);
+            if end.contains(x, y) {
+                self.confirm = None;
+                self.end_app(index);
+            } else if keep.contains(x, y) {
+                self.confirm = None;
+            }
+        } else if app.can_end && layout::end_button(row).contains(x, y) {
+            self.confirm = Some((app.key.clone(), 0));
+        }
+        self.invalidate();
+        true
+    }
+
+    /// Whether a point is on a button of the busy list, which must get clicks
+    /// even in the strip, where everything else drags the window.
+    fn on_app_control(&self, x: f32, y: f32) -> bool {
+        let Some(index) = self.layout.app_at(x, y) else {
+            return false;
+        };
+        let row = self.layout.app_rows[index];
+        let Some(app) = self.monitor.apps.get(index) else {
+            return false;
+        };
+        if self
+            .confirm
+            .as_ref()
+            .is_some_and(|(key, _)| *key == app.key)
+        {
+            let (end, keep) = layout::confirm_buttons(row);
+            end.contains(x, y) || keep.contains(x, y)
+        } else {
+            app.can_end && layout::end_button(row).contains(x, y)
         }
     }
 
@@ -230,6 +379,9 @@ impl App {
                 };
             }
         }
+        if self.on_app_control(x, y) {
+            return HTCLIENT;
+        }
         if self.layout.mode == Mode::Strip || y < TITLE_H {
             HTCAPTION
         } else {
@@ -262,6 +414,7 @@ impl App {
         self.set_hover(Hover {
             inside: true,
             button: self.layout.button_at(x, y),
+            app: self.layout.app_at(x, y),
         });
     }
 
@@ -314,6 +467,9 @@ impl App {
     fn click(&mut self, x: f32, y: f32) {
         if let Some(button) = self.layout.button_at(x, y) {
             self.press(button);
+            return;
+        }
+        if self.click_app(x, y) {
             return;
         }
         let Some(metric) = self.layout.cell_at(x, y) else {
@@ -420,6 +576,11 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
     let hwnd = app.hwnd;
     match message {
         WM_APP_SAMPLE => app.on_sample(),
+        WM_APP_ENDED => app.on_ended(),
+        WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 && app.confirm.is_some() => {
+            app.confirm = None;
+            app.invalidate();
+        }
         WM_NCCALCSIZE if wparam.0 != 0 => {
             // Claiming the whole window as client area removes the standard
             // frame while Windows keeps its resize, Snap and shadow behaviour.
@@ -631,7 +792,12 @@ pub fn run() -> Result<()> {
         let mut client = RECT::default();
         GetClientRect(hwnd, &mut client)?;
         let scale = dpi / BASE_DPI;
-        let layout = layout::compute(client.right as f32 / scale, client.bottom as f32 / scale);
+        let layout = layout::compute(
+            client.right as f32 / scale,
+            client.bottom as f32 / scale,
+            0,
+            false,
+        );
 
         let app = Box::into_raw(Box::new(App {
             hwnd,
@@ -646,6 +812,9 @@ pub fn run() -> Result<()> {
             hover: Hover::default(),
             title: APP_TITLE.to_string(),
             pending: Vec::new(),
+            confirm: None,
+            notice: None,
+            ended: Arc::default(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();

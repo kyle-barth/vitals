@@ -5,10 +5,12 @@
 //! at every severity except critical, and each status also carries a text
 //! label, so it is never signalled by color alone.
 
+use crate::apps::BusyApp;
 use crate::gfx::{Align, Canvas, Color, Weight};
 use crate::history::{CAPACITY, Series};
 use crate::layout::{
-    Button, Cell, Layout, Mode, PAD, Rect, StripItem, StripPlan, TITLE_H, plan_strip,
+    Button, Cell, Layout, Mode, PAD, Rect, StripItem, StripPlan, TITLE_H, confirm_buttons,
+    end_button, plan_strip,
 };
 use crate::metrics::{CoreStatus, MetricId, Monitor, Scale, Unit};
 use crate::severity::Severity;
@@ -60,6 +62,8 @@ pub const LIGHT: Theme = Theme {
 pub struct Hover {
     pub inside: bool,
     pub button: Option<Button>,
+    /// The row of the busy app under the pointer.
+    pub app: Option<usize>,
 }
 
 pub struct View<'a> {
@@ -68,6 +72,10 @@ pub struct View<'a> {
     pub theme: &'a Theme,
     pub hover: Hover,
     pub pinned: bool,
+    /// The app being asked about before it is ended.
+    pub confirm: Option<&'a str>,
+    /// A short message on one app's row: its key, then the text.
+    pub notice: Option<(&'a str, &'a str)>,
 }
 
 /// The colors for one tile at a given severity.
@@ -153,6 +161,220 @@ pub fn paint(c: &Canvas, v: &View) {
     if let Some(area) = v.layout.threads {
         paint_threads(c, v, area);
     }
+    paint_app_rows(c, v, false);
+}
+
+fn paint_app_rows(c: &Canvas, v: &View, flat: bool) {
+    for (i, &row) in v.layout.app_rows.iter().enumerate() {
+        if let Some(app) = v.monitor.apps.get(i) {
+            paint_app_row(c, v, app, i, row, flat);
+        }
+    }
+}
+
+const ICON_SIZE: f32 = 16.0;
+const FROZEN_CPU_GAP: f32 = 12.0;
+/// How far each of two stacked lines sits from a row's center. Equal offsets keep
+/// the pair centered on the icon, with even space above and below.
+const STACK_OFFSET: f32 = 5.5;
+
+/// The status line of a frozen app in a narrow row: the longest wording that
+/// fits. "Not responding" comes first in all of them, so it is never cut off.
+fn frozen_status(cpu_percent: f32, room: f32, width: impl Fn(&str) -> f32) -> String {
+    let long = format!("Not responding · {cpu_percent:.0}% CPU");
+    let short = format!("Not responding · {cpu_percent:.0}%");
+    [long, short]
+        .into_iter()
+        .find(|text| width(text) <= room)
+        .unwrap_or_else(|| "Not responding".to_string())
+}
+
+fn paint_app_icon(c: &Canvas, v: &View, app: &BusyApp, x: f32, y: f32) {
+    let area = Rect::new(x, y - ICON_SIZE / 2.0, ICON_SIZE, ICON_SIZE);
+    if let Some(icon) = &app.icon {
+        c.icon(&app.key, icon, area);
+        return;
+    }
+    c.fill_round(area, 3.0, v.theme.track);
+    let letter: String = app.name.chars().take(1).collect();
+    c.text_mid(
+        &letter.to_uppercase(),
+        (x + ICON_SIZE / 2.0, y),
+        11.0,
+        Weight::Semibold,
+        Align::Center,
+        v.theme.ink,
+    );
+}
+
+/// Draws a small labelled button on a row.
+fn paint_control(c: &Canvas, r: Rect, label: &str, fill: Color, ink: Color) {
+    c.fill_round(r, 4.0, fill);
+    c.text_mid(
+        label,
+        (r.x + r.w / 2.0, r.y + r.h / 2.0),
+        11.0,
+        Weight::Semibold,
+        Align::Center,
+        ink,
+    );
+}
+
+fn paint_app_row(c: &Canvas, v: &View, app: &BusyApp, index: usize, r: Rect, flat: bool) {
+    if v.confirm == Some(app.key.as_str()) {
+        paint_confirm(c, app, r);
+        return;
+    }
+    let hovered = v.hover.app == Some(index);
+    if app.frozen {
+        c.fill_round(r, TILE_RADIUS, CRITICAL);
+    } else if hovered {
+        c.fill_round(r, TILE_RADIUS, v.theme.track);
+    } else if !flat {
+        c.fill_round(r, TILE_RADIUS, v.theme.raised);
+    }
+
+    let y = r.y + r.h / 2.0;
+    let left = r.x + 8.0;
+    paint_app_icon(c, v, app, left, y);
+
+    let mut right = r.right() - 6.0;
+    let shows_end = app.can_end && (app.frozen || hovered);
+    if shows_end {
+        let button = end_button(r);
+        if app.frozen {
+            paint_control(c, button, "End", WHITE, CRITICAL);
+        } else {
+            paint_control(c, button, "End", CRITICAL, WHITE);
+        }
+        right = button.x - 6.0;
+    }
+
+    let name_x = left + ICON_SIZE + 6.0;
+    let name_ink = if app.frozen { WHITE } else { v.theme.ink };
+    let name_room = right - name_x;
+    let notice = v
+        .notice
+        .filter(|(key, _)| *key == app.key)
+        .map(|(_, text)| text);
+
+    if app.frozen {
+        // CPU use tells an app that is hard at work from one that is truly
+        // stuck, which Windows can't do, and they call for opposite decisions.
+        let full = format!("{} not responding", app.name);
+        let cpu = format!("{:.0}% CPU", app.cpu_percent);
+        let needed = c.measure(&full, 12.0, Weight::Semibold)
+            + FROZEN_CPU_GAP
+            + c.measure(&cpu, 11.0, Weight::Regular);
+        if needed <= name_room {
+            c.text_mid(
+                &full,
+                (name_x, y),
+                12.0,
+                Weight::Semibold,
+                Align::Left,
+                name_ink,
+            );
+            c.text_mid(
+                &cpu,
+                (right - 2.0, y),
+                11.0,
+                Weight::Regular,
+                Align::Right,
+                name_ink,
+            );
+        } else {
+            // Stacked rather than dropped, so the status is always spelled out
+            // and never left to the color alone.
+            let name = c.fit(&app.name, 11.0, Weight::Semibold, name_room);
+            let status = frozen_status(app.cpu_percent, name_room, |text| {
+                c.measure(text, 10.0, Weight::Regular)
+            });
+            c.text_mid(
+                &name,
+                (name_x, y - STACK_OFFSET),
+                11.0,
+                Weight::Semibold,
+                Align::Left,
+                name_ink,
+            );
+            c.text_mid(
+                &status,
+                (name_x, y + STACK_OFFSET),
+                10.0,
+                Weight::Regular,
+                Align::Left,
+                name_ink,
+            );
+        }
+        return;
+    }
+
+    let name_w = c.measure(&app.name, 12.0, Weight::Semibold).min(name_room);
+    let name = c.fit(&app.name, 12.0, Weight::Semibold, name_room);
+    c.text_mid(
+        &name,
+        (name_x, y),
+        12.0,
+        Weight::Semibold,
+        Align::Left,
+        name_ink,
+    );
+
+    // Name as many of its readings as fit, biggest first.
+    let room = right - name_x - name_w - 12.0;
+    let mut detail = notice.map_or(String::new(), str::to_string);
+    if notice.is_none() {
+        for label in &app.labels {
+            let next = if detail.is_empty() {
+                label.clone()
+            } else {
+                format!("{detail}  ·  {label}")
+            };
+            if c.measure(&next, 11.0, Weight::Regular) > room {
+                break;
+            }
+            detail = next;
+        }
+    }
+    if !detail.is_empty() {
+        let text = c.fit(&detail, 11.0, Weight::Regular, room);
+        c.text_mid(
+            &text,
+            (right - 2.0, y),
+            11.0,
+            Weight::Regular,
+            Align::Right,
+            v.theme.ink2,
+        );
+    }
+}
+
+/// Asks once more, in place, before ending an app.
+fn paint_confirm(c: &Canvas, app: &BusyApp, r: Rect) {
+    c.fill_round(r, TILE_RADIUS, CRITICAL);
+    let (end, keep) = confirm_buttons(r);
+    let room = end.x - r.x - 16.0;
+    let asks = [
+        format!("End {}? Unsaved work will be lost.", app.name),
+        format!("End {}? Unsaved work is lost.", app.name),
+        format!("End {}?", app.name),
+    ];
+    let question = asks
+        .iter()
+        .find(|text| c.measure(text, 12.0, Weight::Semibold) <= room)
+        .cloned()
+        .unwrap_or_else(|| c.fit(&asks[2], 12.0, Weight::Semibold, room));
+    c.text_mid(
+        &question,
+        (r.x + 10.0, r.y + r.h / 2.0),
+        12.0,
+        Weight::Semibold,
+        Align::Left,
+        WHITE,
+    );
+    paint_control(c, end, "End", WHITE, CRITICAL);
+    paint_control(c, keep, "Keep", WHITE.with_alpha(0.22), WHITE);
 }
 
 fn paint_title_bar(c: &Canvas, v: &View) {
@@ -373,17 +595,25 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
         Rect::new(left, top, right - left, bottom - top)
     };
 
+    // A short tile has no room for a bar under the number, so it sits beside it.
+    let short = r.h < baseline - r.y + 24.0;
     if let Some(total) = bar.filter(|t| *t > 0.0) {
         let fill = reading.value.unwrap_or(0.0) / total;
-        meter(
-            c,
-            Rect::new(left, bar_top, right - left, 6.0),
-            fill,
-            style.mark,
-            style.track,
+        let beside = Rect::new(
+            number_right + 14.0,
+            baseline - size * 0.35 - 3.0,
+            plot_right - number_right - 14.0,
+            6.0,
         );
+        if !short {
+            let below = Rect::new(left, bar_top, right - left, 6.0);
+            meter(c, below, fill, style.mark, style.track);
+        } else if beside.w > 24.0 {
+            meter(c, beside, fill, style.mark, style.track);
+        }
     }
-    if bar.is_none() || wide || r.h > MEMORY_SPARK_MIN_H {
+    let has_room = bar.is_none() || wide || r.h > MEMORY_SPARK_MIN_H;
+    if (has_room && !short) || (bar.is_none() && wide) {
         paint_spark(c, v.monitor, metric, plot, &style);
     }
 }
@@ -722,14 +952,24 @@ fn paint_strip(c: &Canvas, v: &View) {
         _ => v.theme.surface,
     };
     c.clear(surface);
+    if v.layout.strip_is_replaced() {
+        paint_app_rows(c, v, true);
+        return;
+    }
     let critical = severity == Severity::Critical;
     let ink = if critical { WHITE } else { v.theme.ink };
     let muted = if critical { WHITE } else { v.theme.ink3 };
 
-    let strip = plan(c, v);
+    // An app on the second line takes the place of RAM and VRAM.
+    let mut strip = plan(c, v);
+    let app_row = v.layout.app_rows.first().copied();
+    if app_row.is_some() {
+        strip.lines.truncate(1);
+    }
     let count = strip.lines.len() as f32;
-    let pitch = (strip.size * 1.8).min(v.layout.height / count);
-    let first = (v.layout.height - pitch * (count - 1.0)) / 2.0;
+    let height = app_row.map_or(v.layout.height, |row| row.y);
+    let pitch = (strip.size * 1.8).min(height / count);
+    let first = (height - pitch * (count - 1.0)) / 2.0;
     for (row, line) in strip.lines.iter().enumerate() {
         let y = first + row as f32 * pitch;
         let mut x = PAD + 4.0;
@@ -761,6 +1001,8 @@ fn paint_strip(c: &Canvas, v: &View) {
         }
     }
 
+    paint_app_rows(c, v, true);
+
     // The strip has no title bar, so its controls appear only on hover.
     if v.hover.inside {
         let backdrop = v.layout.buttons.iter().fold(None::<Rect>, |area, (_, r)| {
@@ -786,6 +1028,34 @@ fn paint_strip(c: &Canvas, v: &View) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for text measurement: every character is 5 wide.
+    fn chars(text: &str) -> f32 {
+        text.chars().count() as f32 * 5.0
+    }
+
+    #[test]
+    fn a_frozen_app_shows_its_cpu_use_when_there_is_room() {
+        assert_eq!(
+            frozen_status(16.4, 200.0, chars),
+            "Not responding · 16% CPU"
+        );
+    }
+
+    #[test]
+    fn a_stuck_app_shows_zero_rather_than_nothing() {
+        assert_eq!(frozen_status(0.2, 200.0, chars), "Not responding · 0% CPU");
+    }
+
+    #[test]
+    fn a_narrow_row_shortens_the_figure_before_dropping_it() {
+        assert_eq!(frozen_status(16.0, 100.0, chars), "Not responding · 16%");
+    }
+
+    #[test]
+    fn the_status_itself_survives_any_width() {
+        assert_eq!(frozen_status(16.0, 1.0, chars), "Not responding");
+    }
 
     #[test]
     fn auto_scale_never_spans_less_than_its_minimum() {

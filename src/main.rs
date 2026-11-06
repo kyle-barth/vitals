@@ -3,6 +3,7 @@
 // Release builds have no console window. Debug builds keep one for diagnostics.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod apps;
 mod gfx;
 mod helper;
 mod history;

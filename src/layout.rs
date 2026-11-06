@@ -18,6 +18,18 @@ const ROWS_BELOW_WIDTH: f32 = 240.0;
 const LARGE_W: f32 = 820.0;
 const LARGE_H: f32 = 600.0;
 const THREADS_H: f32 = 76.0;
+const APP_ROW_H: f32 = 30.0;
+const APP_ROW_GAP: f32 = 4.0;
+/// From this width, busy apps sit side by side.
+const APP_COLUMNS_W: f32 = 500.0;
+/// The most rows the list may take, however many apps are busy.
+const MAX_APP_ROWS: usize = 3;
+const STRIP_INSET: f32 = 4.0;
+const CONTROL_H: f32 = 20.0;
+const CONTROL_INSET: f32 = 6.0;
+const END_W: f32 = 40.0;
+const CONFIRM_W: f32 = 46.0;
+const KEEP_W: f32 = 42.0;
 /// The grid must show at least this many tiles, otherwise the strip is better.
 const MIN_TILES: usize = 4;
 
@@ -137,12 +149,23 @@ pub struct Layout {
     pub cells: Vec<Cell>,
     pub threads: Option<Rect>,
     pub buttons: Vec<(Button, Rect)>,
+    /// One row per busy app shown, in the same order as the apps.
+    pub app_rows: Vec<Rect>,
 }
 
 impl Layout {
     #[cfg(test)]
     pub fn shows(&self, metric: MetricId) -> bool {
         self.cells.iter().any(|c| c.metric == metric)
+    }
+
+    /// Whether a frozen app has taken over a one-line strip entirely.
+    pub fn strip_is_replaced(&self) -> bool {
+        self.mode == Mode::Strip && self.app_rows.first().is_some_and(|r| r.y <= STRIP_INSET)
+    }
+
+    pub fn app_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.app_rows.iter().position(|r| r.contains(x, y))
     }
 
     pub fn button_at(&self, x: f32, y: f32) -> Option<Button> {
@@ -160,7 +183,79 @@ impl Layout {
     }
 }
 
-pub fn compute(width: f32, height: f32) -> Layout {
+/// Lays out the window for `apps` busy apps, of which the first may be `frozen`.
+/// The list takes room from the tiles, and gives up rows before tiles would be
+/// lost altogether. With no apps, this is the window as it always is.
+pub fn compute(width: f32, height: f32, apps: usize, frozen: bool) -> Layout {
+    let columns = if width >= APP_COLUMNS_W && apps >= 2 {
+        2
+    } else {
+        1
+    };
+    for count in (1..=apps.min(MAX_APP_ROWS * columns)).rev() {
+        let rows = count.div_ceil(columns);
+        let band = rows as f32 * APP_ROW_H + (rows - 1) as f32 * APP_ROW_GAP + GAP;
+        let mut layout = arrange(width, height, band);
+        if layout.mode != Mode::Strip {
+            let cell_w = (width - PAD * 2.0 - GAP * (columns - 1) as f32) / columns as f32;
+            let top = height - PAD - (rows as f32 * (APP_ROW_H + APP_ROW_GAP) - APP_ROW_GAP);
+            layout.app_rows = (0..count)
+                .map(|i| {
+                    let (col, row) = ((i % columns) as f32, (i / columns) as f32);
+                    Rect::new(
+                        PAD + col * (cell_w + GAP),
+                        top + row * (APP_ROW_H + APP_ROW_GAP),
+                        cell_w,
+                        APP_ROW_H,
+                    )
+                })
+                .collect();
+            return layout;
+        }
+    }
+    let mut layout = arrange(width, height, 0.0);
+    if layout.mode == Mode::Strip && apps > 0 {
+        if height >= STRIP_TWO_LINES_H {
+            let row_h = 26.0;
+            layout.app_rows = vec![Rect::new(
+                STRIP_INSET,
+                height - row_h - STRIP_INSET,
+                width - STRIP_INSET * 2.0,
+                row_h,
+            )];
+        } else if frozen {
+            // One line has no room for both, and a frozen app needs acting on.
+            layout.app_rows = vec![Rect::new(
+                STRIP_INSET,
+                STRIP_INSET,
+                width - STRIP_INSET * 2.0,
+                height - STRIP_INSET * 2.0,
+            )];
+            layout.buttons.clear();
+        }
+    }
+    layout
+}
+
+/// The End button on an app's row.
+pub fn end_button(row: Rect) -> Rect {
+    Rect::new(
+        row.right() - CONTROL_INSET - END_W,
+        row.y + (row.h - CONTROL_H) / 2.0,
+        END_W,
+        CONTROL_H,
+    )
+}
+
+/// The End and Keep buttons shown while confirming.
+pub fn confirm_buttons(row: Rect) -> (Rect, Rect) {
+    let y = row.y + (row.h - CONTROL_H) / 2.0;
+    let keep = Rect::new(row.right() - CONTROL_INSET - KEEP_W, y, KEEP_W, CONTROL_H);
+    let end = Rect::new(keep.x - CONFIRM_W - 4.0, y, CONFIRM_W, CONTROL_H);
+    (end, keep)
+}
+
+fn arrange(width: f32, height: f32, band: f32) -> Layout {
     let mut layout = Layout {
         width,
         height,
@@ -168,8 +263,9 @@ pub fn compute(width: f32, height: f32) -> Layout {
         cells: Vec::new(),
         threads: None,
         buttons: Vec::new(),
+        app_rows: Vec::new(),
     };
-    let body = (height - TITLE_H - PAD).max(0.0);
+    let body = (height - TITLE_H - PAD - band).max(0.0);
     if width < ROWS_BELOW_WIDTH {
         let count = (((body + ROW_GAP) / (MIN_ROW_H + ROW_GAP)).floor() as usize).min(ROWS.len());
         if count >= MIN_TILES {
@@ -321,6 +417,10 @@ pub fn plan_strip(
 mod tests {
     use super::*;
 
+    fn plain(width: f32, height: f32) -> Layout {
+        compute(width, height, 0, false)
+    }
+
     fn sizes() -> impl Iterator<Item = (f32, f32)> {
         (140..=1600)
             .step_by(23)
@@ -330,7 +430,7 @@ mod tests {
     #[test]
     fn every_cell_stays_inside_the_window() {
         for (w, h) in sizes() {
-            for c in compute(w, h).cells {
+            for c in plain(w, h).cells {
                 assert!(
                     c.rect.x >= 0.0 && c.rect.right() <= w + 0.01,
                     "{w}x{h} {c:?}"
@@ -346,7 +446,7 @@ mod tests {
     #[test]
     fn cells_never_overlap() {
         for (w, h) in sizes() {
-            let l = compute(w, h);
+            let l = plain(w, h);
             for (i, a) in l.cells.iter().enumerate() {
                 for b in &l.cells[i + 1..] {
                     let apart = a.rect.right() <= b.rect.x + 0.01
@@ -362,7 +462,7 @@ mod tests {
     #[test]
     fn cells_respect_minimum_height() {
         for (w, h) in sizes() {
-            let l = compute(w, h);
+            let l = plain(w, h);
             let min = if l.mode == Mode::Rows {
                 MIN_ROW_H
             } else {
@@ -377,7 +477,7 @@ mod tests {
     #[test]
     fn non_strip_modes_always_lead_with_both_temperatures() {
         for (w, h) in sizes() {
-            let l = compute(w, h);
+            let l = plain(w, h);
             if l.mode != Mode::Strip {
                 assert!(l.cells.len() >= MIN_TILES, "{w}x{h}");
                 assert!(l.shows(CpuTemp) && l.shows(GpuTemp), "{w}x{h}");
@@ -387,14 +487,14 @@ mod tests {
 
     #[test]
     fn four_tiles_fit_from_about_146_tall() {
-        assert_eq!(compute(340.0, 146.0).mode, Mode::Tiles);
-        assert_eq!(compute(340.0, 146.0).cells.len(), 4);
-        assert_eq!(compute(340.0, 120.0).mode, Mode::Strip);
+        assert_eq!(plain(340.0, 146.0).mode, Mode::Tiles);
+        assert_eq!(plain(340.0, 146.0).cells.len(), 4);
+        assert_eq!(plain(340.0, 120.0).mode, Mode::Strip);
     }
 
     #[test]
     fn two_column_grid_keeps_cpu_left_and_gpu_right() {
-        let l = compute(340.0, 470.0);
+        let l = plain(340.0, 470.0);
         let x = |m: MetricId| l.cells.iter().find(|c| c.metric == m).unwrap().rect.x;
         assert!(x(CpuTemp) < x(GpuTemp));
         assert!(x(CpuLoad) < x(GpuLoad));
@@ -403,37 +503,37 @@ mod tests {
 
     #[test]
     fn default_window_shows_hotspot_and_memory() {
-        let l = compute(340.0, 470.0);
+        let l = plain(340.0, 470.0);
         assert!(l.shows(GpuHotspot) && l.shows(Memory) && l.shows(VideoMemory));
     }
 
     #[test]
     fn small_window_shows_hotspot_and_memory_in_its_first_four() {
-        let l = compute(250.0, 160.0);
+        let l = plain(250.0, 160.0);
         assert_eq!(l.cells.len(), 4);
         assert!(l.shows(GpuHotspot) && l.shows(Memory));
     }
 
     #[test]
     fn tall_thin_window_uses_rows_and_shows_eleven_metrics() {
-        let l = compute(190.0, 640.0);
+        let l = plain(190.0, 640.0);
         assert_eq!(l.mode, Mode::Rows);
         assert_eq!(l.cells.len(), 11);
     }
 
     #[test]
     fn large_window_adds_extra_tiles_and_thread_bars() {
-        let l = compute(1240.0, 760.0);
+        let l = plain(1240.0, 760.0);
         assert_eq!(l.cells.len(), 16);
         assert!(l.shows(Upload) && l.shows(DiskRead));
         assert!(l.threads.is_some());
-        assert!(compute(1240.0, 400.0).threads.is_none());
+        assert!(plain(1240.0, 400.0).threads.is_none());
     }
 
     #[test]
     fn pin_and_close_exist_at_every_size() {
         for (w, h) in sizes() {
-            let l = compute(w, h);
+            let l = plain(w, h);
             assert!(l.buttons.iter().any(|(b, _)| *b == Button::Pin), "{w}x{h}");
             assert!(
                 l.buttons.iter().any(|(b, _)| *b == Button::Close),
@@ -444,7 +544,7 @@ mod tests {
 
     #[test]
     fn hit_testing_finds_cells_and_buttons() {
-        let l = compute(340.0, 470.0);
+        let l = plain(340.0, 470.0);
         assert_eq!(l.button_at(335.0, 10.0), Some(Button::Close));
         assert_eq!(l.cell_at(20.0, 40.0), Some(CpuTemp));
         assert_eq!(l.cell_at(20.0, 10.0), None);
@@ -477,5 +577,144 @@ mod tests {
     fn strip_wraps_to_two_lines_when_tall_enough() {
         let plan = plan_strip(320.0, 70.0, measured(58.0));
         assert_eq!(plan.lines.len(), 2);
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.right() - 0.01
+            && b.x < a.right() - 0.01
+            && a.y < b.bottom() - 0.01
+            && b.y < a.bottom() - 0.01
+    }
+
+    #[test]
+    fn no_busy_apps_means_the_window_is_exactly_as_before() {
+        for (w, h) in sizes() {
+            let quiet = compute(w, h, 0, false);
+            assert!(quiet.app_rows.is_empty(), "{w}x{h}");
+            let again = arrange(w, h, 0.0);
+            assert_eq!(quiet.mode, again.mode, "{w}x{h}");
+            assert_eq!(quiet.cells, again.cells, "{w}x{h}");
+            assert_eq!(quiet.threads, again.threads, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn app_rows_stay_inside_the_window_and_clear_of_everything() {
+        for (w, h) in sizes() {
+            for apps in 1..=6 {
+                for frozen in [false, true] {
+                    let l = compute(w, h, apps, frozen);
+                    for (i, row) in l.app_rows.iter().enumerate() {
+                        assert!(row.x >= 0.0 && row.right() <= w + 0.01, "{w}x{h} {row:?}");
+                        assert!(row.y >= 0.0 && row.bottom() <= h + 0.01, "{w}x{h} {row:?}");
+                        for c in &l.cells {
+                            assert!(!overlaps(*row, c.rect), "{w}x{h} {row:?} {c:?}");
+                        }
+                        if let Some(threads) = l.threads {
+                            assert!(!overlaps(*row, threads), "{w}x{h} {row:?}");
+                        }
+                        for other in &l.app_rows[i + 1..] {
+                            assert!(!overlaps(*row, *other), "{w}x{h} {row:?} {other:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiles_keep_their_minimum_height_beside_the_list() {
+        for (w, h) in sizes() {
+            let l = compute(w, h, 3, false);
+            let min = if l.mode == Mode::Rows {
+                MIN_ROW_H
+            } else {
+                MIN_TILE_H
+            };
+            for c in &l.cells {
+                assert!(c.rect.h >= min - 0.01, "{w}x{h} {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_list_never_costs_the_temperatures_when_tiles_are_showing() {
+        for (w, h) in sizes() {
+            let l = compute(w, h, 3, false);
+            if l.mode != Mode::Strip {
+                assert!(l.shows(CpuTemp) && l.shows(GpuTemp), "{w}x{h}");
+                assert!(l.cells.len() >= MIN_TILES, "{w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_window_shows_two_apps_in_a_single_column() {
+        let l = compute(340.0, 470.0, 2, false);
+        assert_eq!(l.mode, Mode::Tiles);
+        assert_eq!(l.app_rows.len(), 2);
+        assert_eq!(l.app_rows[0].x, l.app_rows[1].x);
+    }
+
+    #[test]
+    fn wide_windows_put_apps_side_by_side() {
+        let l = compute(720.0, 380.0, 2, false);
+        assert_eq!(l.app_rows.len(), 2);
+        assert_eq!(l.app_rows[0].y, l.app_rows[1].y);
+        assert!(l.app_rows[0].right() <= l.app_rows[1].x);
+    }
+
+    #[test]
+    fn one_app_uses_the_full_width_of_a_wide_window() {
+        let l = compute(720.0, 380.0, 1, false);
+        assert_eq!(l.app_rows[0].w, 720.0 - PAD * 2.0);
+    }
+
+    #[test]
+    fn the_list_stops_growing_at_its_limit() {
+        assert_eq!(compute(340.0, 800.0, 9, false).app_rows.len(), MAX_APP_ROWS);
+        assert_eq!(
+            compute(1240.0, 760.0, 9, false).app_rows.len(),
+            MAX_APP_ROWS * 2
+        );
+    }
+
+    #[test]
+    fn a_one_line_strip_only_gives_way_to_a_frozen_app() {
+        let busy = compute(320.0, 46.0, 1, false);
+        assert_eq!(busy.mode, Mode::Strip);
+        assert!(busy.app_rows.is_empty());
+        let frozen = compute(320.0, 46.0, 1, true);
+        assert!(frozen.strip_is_replaced());
+        assert_eq!(frozen.app_rows.len(), 1);
+    }
+
+    #[test]
+    fn a_taller_strip_keeps_its_numbers_above_the_app() {
+        let l = compute(320.0, 72.0, 1, false);
+        assert_eq!(l.mode, Mode::Strip);
+        assert_eq!(l.app_rows.len(), 1);
+        assert!(!l.strip_is_replaced());
+        assert!(l.app_rows[0].y > 30.0);
+    }
+
+    #[test]
+    fn controls_stay_inside_their_row() {
+        let row = Rect::new(8.0, 400.0, 174.0, 30.0);
+        let inside = |r: Rect| {
+            r.x >= row.x && r.right() <= row.right() && r.y >= row.y && r.bottom() <= row.bottom()
+        };
+        assert!(inside(end_button(row)));
+        let (end, keep) = confirm_buttons(row);
+        assert!(inside(end) && inside(keep));
+        assert!(end.right() <= keep.x);
+    }
+
+    #[test]
+    fn hit_testing_finds_the_right_app() {
+        let l = compute(340.0, 470.0, 2, false);
+        let second = l.app_rows[1];
+        assert_eq!(l.app_at(second.x + 5.0, second.y + 5.0), Some(1));
+        assert_eq!(l.app_at(20.0, 40.0), None);
     }
 }

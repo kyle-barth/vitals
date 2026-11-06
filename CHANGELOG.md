@@ -3,6 +3,20 @@
 Notable changes to Vitals are listed here. Version numbers follow
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- A Busy list along the bottom of the window, showing apps that are using a lot
+  of CPU, GPU, memory or video memory. It only appears when needed.
+- Apps that have stopped responding are always listed, and reach the taskbar text.
+  Their CPU use is shown too, as a sign of whether they are still working.
+- End an app from its row, with a confirmation first.
+
+### Fixed
+
+- On short tiles, the memory bar no longer runs through the number.
+
 ## [0.1.0] - 2026-11-06
 
 First public release.

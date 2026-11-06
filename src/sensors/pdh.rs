@@ -1,6 +1,7 @@
 //! Windows performance counters for CPU, disk and network activity. These are
 //! the same counters Task Manager reads, so the numbers agree with it.
 
+use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 
 use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -12,6 +13,7 @@ use windows::Win32::System::Performance::{
 use windows::core::{PCWSTR, w};
 
 const BYTES_PER_MB: f32 = 1_000_000.0;
+const BYTES_PER_GB: f32 = 1024.0 * 1024.0 * 1024.0;
 /// Do not cap at 100. Rates and turbo clocks legitimately exceed it.
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 const FORMAT: PDH_FMT = PDH_FMT(PDH_FMT_DOUBLE.0 | PDH_FMT_NOCAP100);
@@ -172,9 +174,90 @@ fn parse_thread(name: &str) -> Option<(u32, u32)> {
     Some((group.parse().ok()?, thread.parse().ok()?))
 }
 
+/// One process's share of the GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuUse {
+    /// How busy its busiest GPU engine is, which is what Task Manager shows.
+    pub engine_percent: f32,
+    pub dedicated_gb: f32,
+}
+
+/// Per-process GPU counters. These have an instance for every engine of every
+/// process using the GPU, so they get their own query, read only while the GPU
+/// is busy.
+pub struct GpuApps {
+    query: PDH_HQUERY,
+    engines: PDH_HCOUNTER,
+    memory: PDH_HCOUNTER,
+}
+
+impl GpuApps {
+    pub fn open() -> Option<Self> {
+        let mut query = PDH_HQUERY::default();
+        // SAFETY: `query` is valid for the call, and is closed on failure or drop.
+        unsafe {
+            if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
+                return None;
+            }
+            let add = |path: PCWSTR| {
+                let mut counter = PDH_HCOUNTER::default();
+                let status = PdhAddEnglishCounterW(query, path, 0, &mut counter);
+                (status == ERROR_SUCCESS.0).then_some(counter)
+            };
+            let engines = add(w!(r"\GPU Engine(*)\Utilization Percentage"));
+            let memory = add(w!(r"\GPU Process Memory(*)\Dedicated Usage"));
+            let (Some(engines), Some(memory)) = (engines, memory) else {
+                PdhCloseQuery(query);
+                return None;
+            };
+            // Rate counters need two samples, so take the first one now.
+            PdhCollectQueryData(query);
+            Some(Self {
+                query,
+                engines,
+                memory,
+            })
+        }
+    }
+
+    pub fn sample(&self) -> HashMap<u32, GpuUse> {
+        let mut apps: HashMap<u32, GpuUse> = HashMap::new();
+        // SAFETY: the query is open for the life of `self`.
+        if unsafe { PdhCollectQueryData(self.query) } != ERROR_SUCCESS.0 {
+            return apps;
+        }
+        for (name, value) in instances(self.engines) {
+            if let Some(pid) = parse_process(&name) {
+                let app = apps.entry(pid).or_default();
+                app.engine_percent = app.engine_percent.max(value);
+            }
+        }
+        for (name, value) in instances(self.memory) {
+            if let Some(pid) = parse_process(&name) {
+                apps.entry(pid).or_default().dedicated_gb += value / BYTES_PER_GB;
+            }
+        }
+        apps
+    }
+}
+
+impl Drop for GpuApps {
+    fn drop(&mut self) {
+        // SAFETY: the query was opened in `open` and is not used after this.
+        unsafe {
+            PdhCloseQuery(self.query);
+        }
+    }
+}
+
+/// Instance names look like "pid_1234_luid_0x0_0xA1B2_phys_0_eng_0_engtype_3D".
+fn parse_process(name: &str) -> Option<u32> {
+    name.strip_prefix("pid_")?.split('_').next()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_thread;
+    use super::{parse_process, parse_thread};
 
     #[test]
     fn parses_thread_instances_and_rejects_totals() {
@@ -182,5 +265,14 @@ mod tests {
         assert_eq!(parse_thread("1,12"), Some((1, 12)));
         assert_eq!(parse_thread("0,_Total"), None);
         assert_eq!(parse_thread("_Total"), None);
+    }
+
+    #[test]
+    fn parses_the_process_from_gpu_instances() {
+        let engine = "pid_1234_luid_0x00000000_0x0000A1B2_phys_0_eng_0_engtype_3D";
+        assert_eq!(parse_process(engine), Some(1234));
+        assert_eq!(parse_process("pid_77_luid_0x0_0x1_phys_0"), Some(77));
+        assert_eq!(parse_process("_Total"), None);
+        assert_eq!(parse_process("pid_x_luid"), None);
     }
 }
