@@ -1,0 +1,665 @@
+//! The Win32 window: a borderless, fully resizable frame that keeps the native
+//! behaviour people expect, including Snap, the Win11 snap layout flyout on the
+//! maximize button, rounded corners, shadows and per-monitor DPI scaling.
+
+use std::mem::size_of;
+use std::sync::{Arc, Mutex};
+
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, RECT, WPARAM,
+};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, InvalidateRect, MONITOR_DEFAULTTONULL, MonitorFromRect, PAINTSTRUCT,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    ProcessPowerThrottling, SetProcessInformation,
+};
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
+};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{HSTRING, PCWSTR, Result, w};
+
+use crate::gfx::Gfx;
+use crate::helper::CoreLink;
+use crate::layout::{self, Button, Layout, Mode, TITLE_H};
+use crate::metrics::{CoreStatus, MetricId, Monitor};
+use crate::sensors::{Latest, Sampler};
+use crate::settings::Settings;
+use crate::ui::{self, DARK, Hover, LIGHT, View};
+
+const CLASS_NAME: PCWSTR = w!("Vitals.Window");
+const INSTANCE_MUTEX: PCWSTR = w!("Local\\Vitals.SingleInstance");
+const APP_TITLE: &str = "Vitals";
+const WM_APP_SAMPLE: u32 = WM_APP + 1;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_NCMOUSELEAVE: u32 = 0x02A2;
+const BASE_DPI: f32 = 96.0;
+const DEFAULT_SIZE: (i32, i32) = (340, 470);
+/// Narrower than this and the strip could not show all three temperatures.
+const MIN_SIZE: (i32, i32) = (190, 36);
+const EDGE: f32 = 5.0;
+const TOP_EDGE: f32 = 3.0;
+
+struct App {
+    hwnd: HWND,
+    gfx: Gfx,
+    layout: Layout,
+    monitor: Monitor,
+    latest: Latest,
+    core: CoreLink,
+    sampler: Option<Sampler>,
+    settings: Settings,
+    dark: bool,
+    hover: Hover,
+    title: String,
+}
+
+impl App {
+    fn scale(&self) -> f32 {
+        // SAFETY: the handle is valid for as long as `App` exists.
+        unsafe { GetDpiForWindow(self.hwnd) as f32 / BASE_DPI }
+    }
+
+    fn relayout(&mut self, width_px: u32, height_px: u32) {
+        let scale = self.scale();
+        self.layout = layout::compute(width_px as f32 / scale, height_px as f32 / scale);
+    }
+
+    fn invalidate(&self) {
+        // SAFETY: the handle is valid for as long as `App` exists.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn paint(&mut self) {
+        let theme = if self.dark { &DARK } else { &LIGHT };
+        let view = View {
+            layout: &self.layout,
+            monitor: &self.monitor,
+            theme,
+            hover: self.hover,
+            pinned: self.settings.always_on_top,
+        };
+        let _ = self.gfx.draw(|canvas| ui::paint(canvas, &view));
+    }
+
+    /// Takes the newest snapshot from the sampler and updates the display.
+    fn on_sample(&mut self) {
+        let snapshot = self.latest.lock().ok().and_then(|mut slot| slot.take());
+        let Some(snapshot) = snapshot else { return };
+        self.monitor.update(snapshot);
+
+        // Declining the prompt is a clear answer, so don't ask at every launch.
+        if self.monitor.core == CoreStatus::Declined {
+            self.settings.core_temp = false;
+        }
+
+        // The title reaches the taskbar, so an alert shows even when covered.
+        let alert = ui::alert_text(&self.layout, &self.monitor);
+        let title = alert.map_or_else(
+            || APP_TITLE.to_string(),
+            |text| format!("{text} - {APP_TITLE}"),
+        );
+        if title != self.title {
+            // SAFETY: the handle is valid and the string outlives the call.
+            unsafe {
+                let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title.as_str()));
+            }
+            self.title = title;
+        }
+
+        // SAFETY: the handle is valid for as long as `App` exists.
+        if !unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.invalidate();
+        }
+    }
+
+    /// Pointer position in device-independent pixels, relative to the window.
+    fn window_point(&self, screen_x: i32, screen_y: i32) -> (f32, f32) {
+        let mut rect = RECT::default();
+        // SAFETY: the handle and out pointer are valid.
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        let scale = self.scale();
+        (
+            (screen_x - rect.left) as f32 / scale,
+            (screen_y - rect.top) as f32 / scale,
+        )
+    }
+
+    fn hit_test(&self, lparam: LPARAM) -> u32 {
+        let (x, y) = self.window_point(signed_low(lparam), signed_high(lparam));
+        let (w, h) = (self.layout.width, self.layout.height);
+        // SAFETY: the handle is valid for as long as `App` exists.
+        let maximized = unsafe { IsZoomed(self.hwnd) }.as_bool();
+        if !maximized {
+            let (left, right) = (x < EDGE, x >= w - EDGE);
+            let (top, bottom) = (y < TOP_EDGE, y >= h - EDGE);
+            match (left, right, top, bottom) {
+                (true, _, true, _) => return HTTOPLEFT,
+                (_, true, true, _) => return HTTOPRIGHT,
+                (true, _, _, true) => return HTBOTTOMLEFT,
+                (_, true, _, true) => return HTBOTTOMRIGHT,
+                (true, ..) => return HTLEFT,
+                (_, true, ..) => return HTRIGHT,
+                (_, _, true, _) => return HTTOP,
+                (_, _, _, true) => return HTBOTTOM,
+                _ => {}
+            }
+        }
+        if let Some(button) = self.layout.button_at(x, y) {
+            if self.layout.mode != Mode::Strip || self.hover.inside {
+                // Reporting the real maximize button is what makes Windows
+                // show the snap layout flyout when the pointer rests on it.
+                return if button == Button::Maximize {
+                    HTMAXBUTTON
+                } else {
+                    HTCLIENT
+                };
+            }
+        }
+        if self.layout.mode == Mode::Strip || y < TITLE_H {
+            HTCAPTION
+        } else {
+            HTCLIENT
+        }
+    }
+
+    fn set_hover(&mut self, hover: Hover) {
+        if hover != self.hover {
+            self.hover = hover;
+            self.invalidate();
+        }
+    }
+
+    fn pointer_moved(&mut self, x: f32, y: f32, non_client: bool) {
+        let mut flags = TME_LEAVE;
+        if non_client {
+            flags |= TME_NONCLIENT;
+        }
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: flags,
+            hwndTrack: self.hwnd,
+            dwHoverTime: 0,
+        };
+        // SAFETY: the structure is valid and sized for the call.
+        unsafe {
+            let _ = TrackMouseEvent(&mut track);
+        }
+        self.set_hover(Hover {
+            inside: true,
+            button: self.layout.button_at(x, y),
+        });
+    }
+
+    /// Whether the pointer is really gone, rather than crossing between the
+    /// client and non-client parts of this same window.
+    fn pointer_left(&mut self) {
+        let mut point = POINT::default();
+        let mut rect = RECT::default();
+        // SAFETY: the out pointers are valid.
+        let inside = unsafe {
+            GetCursorPos(&mut point).is_ok()
+                && GetWindowRect(self.hwnd, &mut rect).is_ok()
+                && point.x >= rect.left
+                && point.x < rect.right
+                && point.y >= rect.top
+                && point.y < rect.bottom
+        };
+        if !inside {
+            self.set_hover(Hover::default());
+        }
+    }
+
+    fn press(&mut self, button: Button) {
+        // SAFETY: the handle is valid for as long as `App` exists.
+        unsafe {
+            match button {
+                Button::Close => {
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                Button::Minimize => {
+                    let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+                }
+                Button::Maximize => {
+                    let command = if IsZoomed(self.hwnd).as_bool() {
+                        SW_RESTORE
+                    } else {
+                        SW_MAXIMIZE
+                    };
+                    let _ = ShowWindow(self.hwnd, command);
+                }
+                Button::Pin => {
+                    self.settings.always_on_top = !self.settings.always_on_top;
+                    self.apply_pin();
+                    self.invalidate();
+                }
+            }
+        }
+    }
+
+    fn apply_pin(&self) {
+        let order = if self.settings.always_on_top {
+            HWND_TOPMOST
+        } else {
+            HWND_NOTOPMOST
+        };
+        // SAFETY: the handle is valid for as long as `App` exists.
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(order),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn click(&mut self, x: f32, y: f32) {
+        if let Some(button) = self.layout.button_at(x, y) {
+            self.press(button);
+            return;
+        }
+        let Some(metric) = self.layout.cell_at(x, y) else {
+            return;
+        };
+        if metric == MetricId::CpuTemp && self.monitor.cpu_temp_metric() == MetricId::IoDieTemp {
+            if matches!(self.monitor.core, CoreStatus::Off | CoreStatus::Declined) {
+                self.settings.core_temp = true;
+                self.core.start(self.hwnd.0 as isize);
+            }
+            return;
+        }
+        if metric.spec().limits.is_some() {
+            self.monitor.reset_peak(metric);
+            self.invalidate();
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let mut placement = WINDOWPLACEMENT {
+            length: size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: the handle and structure are valid, and the length is set.
+        if unsafe { GetWindowPlacement(self.hwnd, &mut placement) }.is_ok() {
+            let r = placement.rcNormalPosition;
+            self.settings.placement = Some((r.left, r.top, r.right, r.bottom));
+            self.settings.maximized = placement.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+        }
+        let _ = self.settings.save();
+    }
+
+    fn apply_theme(&mut self) {
+        self.dark = system_uses_dark_mode();
+        let value = i32::from(self.dark);
+        // SAFETY: the attribute value is valid for the size given.
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&raw const value).cast(),
+                size_of::<i32>() as u32,
+            );
+        }
+        self.invalidate();
+    }
+}
+
+fn signed_low(value: LPARAM) -> i32 {
+    (value.0 & 0xffff) as i16 as i32
+}
+
+fn signed_high(value: LPARAM) -> i32 {
+    ((value.0 >> 16) & 0xffff) as i16 as i32
+}
+
+fn system_uses_dark_mode() -> bool {
+    let (mut light, mut size) = (0u32, size_of::<u32>() as u32);
+    // SAFETY: the out pointers are valid and sized for a REG_DWORD.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut light).cast()),
+            Some(&mut size),
+        )
+    };
+    status.is_err() || light == 0
+}
+
+unsafe extern "system" fn window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: the pointer is stored once, straight after creation, and is
+    // cleared before the `App` is freed. Everything runs on the UI thread.
+    let app = unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App).as_mut() };
+    if let Some(app) = app {
+        if let Some(result) = handle(app, message, wparam, lparam) {
+            return result;
+        }
+    } else if message == WM_NCCALCSIZE && wparam.0 != 0 {
+        return LRESULT(0);
+    }
+    // SAFETY: forwards this window's own message unchanged.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    let hwnd = app.hwnd;
+    match message {
+        WM_APP_SAMPLE => app.on_sample(),
+        WM_NCCALCSIZE if wparam.0 != 0 => {
+            // Claiming the whole window as client area removes the standard
+            // frame while Windows keeps its resize, Snap and shadow behaviour.
+            // A maximized window hangs past the screen by its frame thickness,
+            // so that overhang is taken back here.
+            // SAFETY: for this message, `lparam` points to NCCALCSIZE_PARAMS.
+            unsafe {
+                if IsZoomed(hwnd).as_bool() {
+                    let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+                    let dpi = GetDpiForWindow(hwnd);
+                    let frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+                        + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    let rect = &mut params.rgrc[0];
+                    rect.left += frame;
+                    rect.top += frame;
+                    rect.right -= frame;
+                    rect.bottom -= frame;
+                }
+            }
+            return Some(LRESULT(0));
+        }
+        WM_NCHITTEST => return Some(LRESULT(app.hit_test(lparam) as isize)),
+        WM_ERASEBKGND => return Some(LRESULT(1)),
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            // SAFETY: Begin and End are paired on this window.
+            unsafe {
+                BeginPaint(hwnd, &mut paint);
+                app.paint();
+                let _ = EndPaint(hwnd, &paint);
+            }
+            return Some(LRESULT(0));
+        }
+        WM_SIZE => {
+            let (width, height) = (
+                (lparam.0 & 0xffff) as u32,
+                ((lparam.0 >> 16) & 0xffff) as u32,
+            );
+            if width > 0 && height > 0 {
+                app.gfx.resize(width, height);
+                app.relayout(width, height);
+                // Painting now, rather than waiting for WM_PAINT, keeps the
+                // content in step with the frame during a live resize.
+                app.paint();
+            }
+            return Some(LRESULT(0));
+        }
+        WM_GETMINMAXINFO => {
+            // SAFETY: for this message, `lparam` points to MINMAXINFO.
+            unsafe {
+                let info = &mut *(lparam.0 as *mut MINMAXINFO);
+                let dpi = GetDpiForWindow(hwnd) as f32 / BASE_DPI;
+                info.ptMinTrackSize.x = (MIN_SIZE.0 as f32 * dpi) as i32;
+                info.ptMinTrackSize.y = (MIN_SIZE.1 as f32 * dpi) as i32;
+            }
+            return Some(LRESULT(0));
+        }
+        WM_DPICHANGED => {
+            let dpi = (wparam.0 & 0xffff) as f32;
+            app.gfx.set_dpi(dpi);
+            // SAFETY: for this message, `lparam` points to the suggested rectangle.
+            unsafe {
+                let r = &*(lparam.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            return Some(LRESULT(0));
+        }
+        WM_MOUSEMOVE => {
+            let scale = app.scale();
+            let (x, y) = (
+                signed_low(lparam) as f32 / scale,
+                signed_high(lparam) as f32 / scale,
+            );
+            app.pointer_moved(x, y, false);
+        }
+        WM_NCMOUSEMOVE => {
+            let (x, y) = app.window_point(signed_low(lparam), signed_high(lparam));
+            app.pointer_moved(x, y, true);
+        }
+        WM_MOUSELEAVE | WM_NCMOUSELEAVE => app.pointer_left(),
+        WM_LBUTTONUP => {
+            let scale = app.scale();
+            app.click(
+                signed_low(lparam) as f32 / scale,
+                signed_high(lparam) as f32 / scale,
+            );
+        }
+        WM_NCLBUTTONDOWN if wparam.0 as u32 == HTMAXBUTTON => return Some(LRESULT(0)),
+        WM_NCLBUTTONUP if wparam.0 as u32 == HTMAXBUTTON => {
+            app.press(Button::Maximize);
+            return Some(LRESULT(0));
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => app.apply_theme(),
+        WM_ENDSESSION if wparam.0 != 0 => app.save_settings(),
+        WM_DESTROY => {
+            app.save_settings();
+            // SAFETY: called on the thread that owns the message queue.
+            unsafe { PostQuitMessage(0) };
+            return Some(LRESULT(0));
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Lets Windows run this on efficient cores at low clocks where it can. A
+/// monitor should cost as little as possible, and one update per second has no
+/// need for peak speed.
+fn request_efficiency_mode() {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    // SAFETY: the structure is valid for the size given.
+    unsafe {
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&raw const state).cast(),
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+/// Brings an existing window forward. Returns true if there was one.
+fn activate_existing() -> bool {
+    // SAFETY: the class name is a valid string.
+    let Ok(existing) = (unsafe { FindWindowW(CLASS_NAME, None) }) else {
+        return false;
+    };
+    // SAFETY: a stale handle simply makes these calls fail harmlessly.
+    unsafe {
+        let _ = ShowWindow(existing, SW_RESTORE);
+        let _ = SetForegroundWindow(existing);
+    }
+    true
+}
+
+/// The saved window rectangle, if it is still on a connected monitor.
+fn saved_rect(settings: &Settings) -> Option<RECT> {
+    let (left, top, right, bottom) = settings.placement?;
+    let rect = RECT {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    let sized = right - left >= MIN_SIZE.0 && bottom - top >= MIN_SIZE.1;
+    // SAFETY: the rectangle is valid for the call.
+    let on_screen = !unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) }.is_invalid();
+    (sized && on_screen).then_some(rect)
+}
+
+pub fn run() -> Result<()> {
+    // SAFETY: the mutex is held for the life of the process, so only one
+    // window is ever running.
+    let _instance: HANDLE = unsafe { CreateMutexW(None, true, INSTANCE_MUTEX)? };
+    // SAFETY: reads this thread's last error, set by the call above.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        activate_existing();
+        return Ok(());
+    }
+    request_efficiency_mode();
+
+    let settings = Settings::load();
+    // SAFETY: the window class and creation parameters are valid, and the
+    // `App` box outlives the message loop.
+    unsafe {
+        let instance: HINSTANCE = GetModuleHandleW(None)?.into();
+        let class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance,
+            hIcon: LoadIconW(Some(instance), PCWSTR(std::ptr::without_provenance(1)))?,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: CLASS_NAME,
+            ..Default::default()
+        };
+        if RegisterClassExW(&class) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let system_scale = GetDpiForSystem() as f32 / BASE_DPI;
+        let (x, y, width, height) = match saved_rect(&settings) {
+            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => (
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                (DEFAULT_SIZE.0 as f32 * system_scale) as i32,
+                (DEFAULT_SIZE.1 as f32 * system_scale) as i32,
+            ),
+        };
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            CLASS_NAME,
+            &HSTRING::from(APP_TITLE),
+            WS_OVERLAPPEDWINDOW,
+            x,
+            y,
+            width,
+            height,
+            None,
+            None,
+            Some(instance),
+            None,
+        )?;
+
+        let corners = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corners).cast(),
+            size_of::<i32>() as u32,
+        );
+
+        let latest: Latest = Arc::new(Mutex::new(None));
+        let core = CoreLink::default();
+        let dpi = GetDpiForWindow(hwnd) as f32;
+        let mut client = RECT::default();
+        GetClientRect(hwnd, &mut client)?;
+        let scale = dpi / BASE_DPI;
+        let layout = layout::compute(client.right as f32 / scale, client.bottom as f32 / scale);
+
+        let app = Box::into_raw(Box::new(App {
+            hwnd,
+            gfx: Gfx::new(hwnd, dpi)?,
+            layout,
+            monitor: Monitor::default(),
+            latest: latest.clone(),
+            core: core.clone(),
+            sampler: None,
+            settings,
+            dark: system_uses_dark_mode(),
+            hover: Hover::default(),
+            title: APP_TITLE.to_string(),
+        }));
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+        (*app).apply_theme();
+        (*app).apply_pin();
+
+        // Recalculate the frame now that WM_NCCALCSIZE reaches `App`.
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        )?;
+
+        let target = hwnd.0 as isize;
+        (*app).sampler = Some(Sampler::start(latest, core.clone(), move || {
+            // SAFETY: posting to a window that has gone simply fails.
+            let _ = PostMessageW(
+                Some(HWND(target as *mut _)),
+                WM_APP_SAMPLE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }));
+
+        let maximized = (*app).settings.maximized;
+        let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
+        if (*app).settings.core_temp {
+            core.start(hwnd.0 as isize);
+        }
+
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        // The window is gone, so no more messages can reach `App`.
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        drop(Box::from_raw(app));
+        let _ = CloseHandle(_instance);
+    }
+    Ok(())
+}

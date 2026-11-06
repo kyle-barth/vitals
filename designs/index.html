@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vitals Designs</title>
+<style>
+  :root {
+    --page: #111110; --panel: #181817; --ink: #f0efec; --ink2: #c3c2b7; --ink3: #8f8e85; --line: #2c2c2a;
+    --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  :root[data-theme="light"] {
+    --page: #ecebe6; --panel: #f6f5f1; --ink: #0b0b0b; --ink2: #52514e; --ink3: #76756f; --line: #dcdbd5;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--page); }
+  body { margin: 0; padding: 24px 16px 64px; background: var(--page); color: var(--ink); font: 14px/1.45 var(--font); }
+  .wrap { max-width: 1320px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 8px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0; }
+  .note { color: var(--ink2); margin: 0 0 24px; max-width: 76ch; }
+  button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
+  h2 { font-size: 16px; font-weight: 600; margin: 0 0 2px; }
+  section > p { color: var(--ink2); margin: 0 0 14px; max-width: 80ch; }
+  .frames { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  figure { margin: 0; max-width: 100%; }
+  figcaption { color: var(--ink3); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .frame { position: relative; resize: both; overflow: hidden; border-radius: 8px; max-width: 100%;
+           min-width: 120px; min-height: 36px; box-shadow: 0 0 0 1px var(--line), 0 8px 24px rgba(0,0,0,.28); }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Vitals: four design directions</h1>
+    <button id="theme">Toggle light / dark</button>
+  </header>
+  <p class="note">Every frame is live. Drag a bottom-right corner to resize it: each design has its own layout rules, and the same window has to work as a slim strip, a small widget, and a large dashboard. Values are simulated around real readings from this PC. Everything here is drawn on canvas with primitives that map one-to-one to Direct2D.</p>
+  <div id="root"></div>
+</div>
+
+<script>
+'use strict';
+const params = new URLSearchParams(location.search);
+const FONT = '"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif';
+const THEMES = {
+  dark:  { surface:'#1a1a19', raised:'#232322', line:'#2f2f2c', track:'#333330', ink:'#f0efec', ink2:'#c3c2b7', ink3:'#8f8e85',
+           cpu:'#3987e5', gpu:'#d95926', ram:'#199e70', vram:'#c98500', disk:'#d55181', net:'#9085e9' },
+  light: { surface:'#fcfcfb', raised:'#f3f2ee', line:'#e4e3de', track:'#e4e3de', ink:'#0b0b0b', ink2:'#52514e', ink3:'#76756f',
+           cpu:'#2a78d6', gpu:'#eb6834', ram:'#1baf7a', vram:'#eda100', disk:'#e87ba4', net:'#6250d6' },
+};
+const STATUS = { warm:'#fab219', hot:'#ec835a', crit:'#d03b3b', ok:'#0ca30c' };
+let theme = params.get('theme') === 'light' ? 'light' : 'dark';
+let C = THEMES[theme];
+document.documentElement.dataset.theme = theme;
+
+/* ---------- simulated sensors, anchored to values read from this machine ---------- */
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const HIST = 120;
+const M = {
+  cpuT:{v:71,  base:71,  j:2.2, lo:30, hi:96,  unit:'°', f:0},
+  iodT:{v:66,  base:66,  j:1.0, lo:30, hi:96,  unit:'°', f:0},
+  gpuT:{v:77,  base:77,  j:1.4, lo:30, hi:110, unit:'°', f:0},
+  hotT:{v:101, base:101, j:2.4, lo:30, hi:115, unit:'°', f:0},
+  memT:{v:92,  base:92,  j:1.0, lo:30, hi:110, unit:'°', f:0},
+  cpuU:{v:28,  base:28,  j:9,   lo:0,  hi:100, unit:'%', f:0},
+  gpuU:{v:92,  base:92,  j:6,   lo:0,  hi:100, unit:'%', f:0},
+  cpuC:{v:5.18,base:5.18,j:.05, lo:0,  hi:5.4, unit:' GHz', f:2},
+  gpuC:{v:2440,base:2440,j:30,  lo:0,  hi:2800,unit:' MHz', f:0},
+  cpuP:{v:69,  base:69,  j:7,   lo:0,  hi:162, unit:' W', f:0},
+  gpuP:{v:329, base:329, j:12,  lo:0,  hi:355, unit:' W', f:0},
+  fan: {v:2794,base:2794,j:40,  lo:0,  hi:3300,unit:' rpm',f:0},
+  ram: {v:18.4,base:18.4,j:.08, lo:0,  hi:31.1,unit:' GB', f:1},
+  vram:{v:14.2,base:14.2,j:.06, lo:0,  hi:24,  unit:' GB', f:1},
+  dRd: {v:24,  base:24,  j:30,  lo:0,  hi:400, unit:' MB/s', f:0},
+  dWr: {v:12,  base:12,  j:18,  lo:0,  hi:400, unit:' MB/s', f:0},
+  nDn: {v:6.2, base:6.2, j:5,   lo:0,  hi:100, unit:' MB/s', f:1},
+  nUp: {v:.8,  base:.8,  j:1,   lo:0,  hi:100, unit:' MB/s', f:1},
+};
+for (const m of Object.values(M)) m.h = [];
+const cores = Array.from({length:16}, (_, i) => ({v: 12 + rnd()*40, b: 8 + (i % 2 ? 6 : 34) * rnd() * 1.6}));
+function step() {
+  for (const m of Object.values(M)) {
+    m.v += (m.base - m.v) * .1 + (rnd() - .5) * m.j;
+    m.v = Math.max(m.lo, Math.min(m.hi, m.v));
+    m.h.push(m.v); if (m.h.length > HIST) m.h.shift();
+  }
+  for (const c of cores) c.v = Math.max(1, Math.min(100, c.v + (c.b - c.v) * .3 + (rnd() - .5) * 16));
+}
+for (let i = 0; i < HIST; i++) step();
+
+/* Temperature severity: fill carries severity, and it always ships with a text label. */
+const LIMITS = { cpuT:[75,85,95], iodT:[80,90,100], gpuT:[80,90,100], hotT:[95,105,112], memT:[92,100,106] };
+function sev(key) {
+  const l = LIMITS[key], v = M[key].v;
+  if (!l) return {label:'', color:null};
+  if (v >= l[2]) return {label:'Critical', color:STATUS.crit};
+  if (v >= l[1]) return {label:'Hot', color:STATUS.hot};
+  if (v >= l[0]) return {label:'Warm', color:STATUS.warm};
+  return {label:'Normal', color:null};
+}
+const fmt = (k) => M[k].v.toFixed(M[k].f);
+
+/* ---------- drawing primitives: each maps directly to a Direct2D / DirectWrite call ---------- */
+function text(g, s, x, y, o = {}) {
+  g.font = `${o.w || 400} ${o.s || 12}px ${FONT}`;
+  g.fillStyle = o.c || C.ink; g.textAlign = o.a || 'left'; g.textBaseline = o.b || 'alphabetic';
+  g.fillText(s, x, y);
+  return g.measureText(s).width;
+}
+function width(g, s, size, w = 400) { g.font = `${w} ${size}px ${FONT}`; return g.measureText(s).width; }
+function rr(g, x, y, w, h, r, c) { g.fillStyle = c; g.beginPath(); g.roundRect(x, y, w, h, r); g.fill(); }
+function meter(g, x, y, w, h, frac, color) {
+  rr(g, x, y, w, h, h / 2, C.track);
+  const f = Math.max(0, Math.min(1, frac));
+  if (f > .004) rr(g, x, y, Math.max(h, w * f), h, h / 2, color);
+}
+function spark(g, data, x, y, w, h, lo, hi, color, o = {}) {
+  if (w < 8 || h < 6) return;
+  const n = data.length, px = i => x + (i / (n - 1)) * w, py = v => y + h - ((v - lo) / (hi - lo)) * h;
+  g.beginPath(); data.forEach((v, i) => i ? g.lineTo(px(i), py(v)) : g.moveTo(px(i), py(v)));
+  if (o.wash !== false) {
+    g.save(); g.lineTo(x + w, y + h); g.lineTo(x, y + h); g.closePath();
+    g.globalAlpha = .1; g.fillStyle = color; g.fill(); g.restore();
+    g.beginPath(); data.forEach((v, i) => i ? g.lineTo(px(i), py(v)) : g.moveTo(px(i), py(v)));
+  }
+  g.strokeStyle = color; g.lineWidth = o.lw || 2; g.lineJoin = g.lineCap = 'round'; g.stroke();
+  if (o.dot !== false) {
+    const ex = px(n - 1), ey = py(data[n - 1]);
+    g.fillStyle = o.ring || C.surface; g.beginPath(); g.arc(ex, ey, 6, 0, 7); g.fill();
+    g.fillStyle = color; g.beginPath(); g.arc(ex, ey, 4, 0, 7); g.fill();
+  }
+}
+function arcMeter(g, cx, cy, r, th, frac, color) {
+  const a0 = Math.PI * .75, sweep = Math.PI * 1.5;
+  g.lineWidth = th; g.lineCap = 'round';
+  g.strokeStyle = C.track; g.beginPath(); g.arc(cx, cy, r, a0, a0 + sweep); g.stroke();
+  g.strokeStyle = color; g.beginPath(); g.arc(cx, cy, r, a0, a0 + sweep * Math.max(.005, Math.min(1, frac))); g.stroke();
+}
+/* A status always pairs a colored dot with a label, never color alone. */
+function chip(g, s, right, y) {
+  if (!s.label || s.label === 'Normal') return;
+  const tw = width(g, s.label, 11, 600);
+  text(g, s.label, right, y, {s:11, w:600, c:C.ink2, a:'right', b:'middle'});
+  g.fillStyle = s.color; g.beginPath(); g.arc(right - tw - 8, y, 4, 0, 7); g.fill();
+}
+function titlebar(g, w, name = 'Vitals') {
+  const H = 28, y = H / 2;
+  text(g, name, 10, y, {s:12, w:600, c:C.ink2, b:'middle'});
+  g.strokeStyle = C.ink3; g.lineWidth = 1.2; g.lineCap = 'round';
+  const bx = (i) => w - 15 - i * 26;
+  g.beginPath(); g.moveTo(bx(0) - 4, y - 4); g.lineTo(bx(0) + 4, y + 4); g.moveTo(bx(0) + 4, y - 4); g.lineTo(bx(0) - 4, y + 4); g.stroke();
+  if (w >= 170) { g.strokeRect(bx(1) - 4, y - 4, 8, 8); g.beginPath(); g.moveTo(bx(2) - 4, y); g.lineTo(bx(2) + 4, y); g.stroke(); }
+  if (w >= 200) { g.beginPath(); g.arc(bx(3), y - 1.5, 2.6, 0, 7); g.moveTo(bx(3), y + 1); g.lineTo(bx(3), y + 5); g.stroke(); }
+  return H;
+}
+/* Shared smallest tier: one line, no chrome, the whole strip is draggable. */
+function strip(g, w, h) {
+  const items = [['CPU','cpuT','°'], ['GPU','gpuT','°'], ['Hot','hotT','°'], ['RAM',null,'%'], ['VRAM',null,'%']];
+  const val = (it) => it[1] ? fmt(it[1]) : Math.round(100 * (it[0] === 'RAM' ? M.ram.v / M.ram.hi : M.vram.v / M.vram.hi));
+  const size = Math.max(12, Math.min(h * .42, 22));
+  let x = 12; const y = h / 2;
+  for (const it of items) {
+    const a = width(g, it[0] + ' ', size * .72, 400), b = width(g, val(it) + it[2], size, 600);
+    if (x + a + b + 8 > w) break;
+    x += text(g, it[0] + ' ', x, y, {s:size * .72, c:C.ink3, b:'middle'});
+    x += text(g, val(it) + it[2], x, y, {s:size, w:600, b:'middle'});
+    const s = it[1] ? sev(it[1]) : {};
+    if (s.color) { g.fillStyle = s.color; g.beginPath(); g.arc(x + 7, y, 3.5, 0, 7); g.fill(); x += 12; }
+    x += Math.max(14, size * .8);
+  }
+}
+
+/* ---------- A: Tiles ---------- */
+function A_tiles(g, w, h) {
+  if (h < 84) return strip(g, w, h);
+  const top = titlebar(g, w), pad = 8, gap = 6, Rh = h - top - pad;
+  const cols = w < 240 ? 1 : w < 500 ? 2 : w < 820 ? 3 : 4;
+  const minH = w < 240 ? 56 : 74;
+  const fitRows = Math.max(1, Math.floor((Rh + gap) / (minH + gap)));
+  const items = [
+    {k:'cpuT', n:'CPU temp', c:C.cpu}, {k:'gpuT', n:'GPU temp', c:C.gpu},
+    {k:'cpuU', n:'CPU load', c:C.cpu}, {k:'gpuU', n:'GPU load', c:C.gpu},
+    {k:'ram',  n:'Memory', c:C.ram, bar:1}, {k:'vram', n:'Video memory', c:C.vram, bar:1},
+    {k:'hotT', n:'GPU hotspot', c:C.gpu}, {k:'memT', n:'VRAM temp', c:C.vram},
+    {k:'gpuP', n:'GPU power', c:C.gpu}, {k:'cpuP', n:'CPU power', c:C.cpu},
+    {k:'fan',  n:'GPU fan', c:C.gpu}, {k:'nDn', n:'Download', c:C.net},
+  ];
+  const n = Math.min(items.length, cols * fitRows), rows = Math.ceil(n / cols);
+  const tw = (w - pad * 2 - gap * (cols - 1)) / cols, th = (Rh - gap * (rows - 1)) / rows;
+  items.slice(0, n).forEach((it, i) => {
+    const cx = i % cols, cy = Math.floor(i / cols), x = pad + cx * (tw + gap), y = top + cy * (th + gap);
+    const m = M[it.k], s = sev(it.k), tw2 = (i === n - 1 && n % cols) ? tw + (cols - n % cols) * (tw + gap) : tw;
+    rr(g, x, y, tw2, th, 6, C.raised);
+    text(g, it.n, x + 10, y + 16, {s:12, c:C.ink2, b:'middle'});
+    chip(g, s, x + tw2 - 10, y + 16);
+    const size = Math.max(20, Math.min(th * .34, tw2 * .22, 52)), vy = y + 28 + size * .82;
+    const vw = text(g, fmt(it.k), x + 10, vy, {s:size, w:600});
+    if (m.unit === '°') text(g, '°', x + 10 + vw, vy, {s:size, w:400, c:C.ink2}); else text(g, m.unit, x + 10 + vw + 2, vy, {s:Math.max(12, size * .42), c:C.ink2});
+    const by = vy + 8, bh = y + th - by - 10;
+    const color = s.color || it.c;
+    if (it.bar) {
+      if (bh > 4) meter(g, x + 10, y + th - 16, tw2 - 20, 6, m.v / m.hi, color);
+      if (th > 90) text(g, `of ${m.hi.toFixed(m.f)} GB`, x + tw2 - 10, vy, {s:12, c:C.ink3, a:'right'});
+    } else if (bh > 10) {
+      spark(g, m.h.slice(-60), x + 10, by, tw2 - 26, bh, m.lo, m.hi, color, {ring:C.raised});
+    }
+  });
+}
+
+/* ---------- B: Dials ---------- */
+function B_dials(g, w, h) {
+  if (h < 84) return strip(g, w, h);
+  const top = titlebar(g, w), pad = 12;
+  const band = h >= 240 ? 46 : 0, Rh = h - top - band - 6;
+  const row = (w - pad * 2) >= Rh * .95;
+  const cw = row ? (w - pad * 2) / 2 : w - pad * 2, ch = row ? Rh : Rh / 2;
+  const sub = (ch >= 170 && cw >= 190) ? 44 : 0;
+  const cells = [
+    {k:'cpuT', n:'CPU', c:C.cpu, d:'Ryzen 7 9800X3D', st:[['Load', Math.round(M.cpuU.v)+'%'], ['Clock', M.cpuC.v.toFixed(2)+' GHz'], ['Power', Math.round(M.cpuP.v)+' W']], rng:[20,100]},
+    {k:'gpuT', n:'GPU', c:C.gpu, d:'RX 7900 XTX', st:[['Load', Math.round(M.gpuU.v)+'%'], ['Hotspot', Math.round(M.hotT.v)+'°'], ['Power', Math.round(M.gpuP.v)+' W']], rng:[20,110]},
+  ];
+  cells.forEach((cell, i) => {
+    const x = pad + (row ? i * cw : 0), y = top + (row ? 0 : i * ch);
+    const r = Math.max(26, Math.min(cw * .4, (ch - sub) * .47)), th = Math.max(6, r * .13);
+    const cx = x + cw / 2, cy = y + (ch - sub) / 2 + r * .08;
+    const s = sev(cell.k), m = M[cell.k];
+    arcMeter(g, cx, cy, r, th, (m.v - cell.rng[0]) / (cell.rng[1] - cell.rng[0]), s.color || cell.c);
+    const size = Math.max(16, r * .62);
+    text(g, fmt(cell.k) + '°', cx, cy + size * .12, {s:size, w:600, a:'center', b:'middle'});
+    text(g, cell.n, cx, cy + size * .62 + 4, {s:Math.max(11, r * .17), c:C.ink2, a:'center', b:'middle'});
+    if (r > 44) {
+      const lab = s.label && s.label !== 'Normal' ? s.label : '';
+      if (lab) { const yy = cy + r * .78; text(g, lab, cx, yy, {s:11, w:600, c:C.ink2, a:'center', b:'middle'}); }
+    }
+    if (sub) cell.st.forEach((st, j) => {
+      const sx = x + (cw / 3) * (j + .5), sy = y + ch - sub + 6;
+      text(g, st[1], sx, sy + 8, {s:13, w:600, a:'center', b:'middle'});
+      text(g, st[0], sx, sy + 26, {s:11, c:C.ink3, a:'center', b:'middle'});
+    });
+  });
+  if (band) {
+    const y = h - band, bw = (w - pad * 2 - 16) / 2;
+    [['Memory', 'ram', C.ram], ['Video memory', 'vram', C.vram]].forEach(([n, k, c], i) => {
+      const x = pad + i * (bw + 16), m = M[k];
+      text(g, n, x, y + 8, {s:12, c:C.ink2, b:'middle'});
+      text(g, `${m.v.toFixed(1)} / ${m.hi.toFixed(m.hi % 1 ? 1 : 0)} GB`, x + bw, y + 8, {s:12, w:600, a:'right', b:'middle'});
+      meter(g, x, y + 20, bw, 6, m.v / m.hi, c);
+    });
+  }
+}
+
+/* ---------- C: Strips ---------- */
+function C_strips(g, w, h) {
+  if (h < 84) return strip(g, w, h);
+  const top = titlebar(g, w), pad = 10, axis = h >= 200 ? 18 : 0;
+  const cols = w >= 620 ? 2 : 1, minH = 50, gapX = 18;
+  const Rh = h - top - axis - 4;
+  const fit = Math.max(1, Math.floor(Rh / minH));
+  const items = [
+    {n:'CPU temp', k:'cpuT', c:C.cpu, lim:75}, {n:'GPU temp', k:'gpuT', c:C.gpu, lim:80, extra:'hotT'},
+    {n:'CPU load', k:'cpuU', c:C.cpu}, {n:'GPU load', k:'gpuU', c:C.gpu},
+    {n:'Memory', k:'ram', c:C.ram, cap:1}, {n:'Video memory', k:'vram', c:C.vram, cap:1},
+    {n:'GPU power', k:'gpuP', c:C.gpu}, {n:'CPU power', k:'cpuP', c:C.cpu},
+    {n:'GPU fan', k:'fan', c:C.gpu}, {n:'Download', k:'nDn', c:C.net},
+    {n:'Disk read', k:'dRd', c:C.disk}, {n:'Upload', k:'nUp', c:C.net},
+  ];
+  const n = Math.min(items.length, fit * cols), rows = Math.ceil(n / cols), sh = Rh / rows;
+  const colW = (w - pad * 2 - gapX * (cols - 1)) / cols;
+  items.slice(0, n).forEach((it, i) => {
+    const cx = i % cols, cy = Math.floor(i / cols), x = pad + cx * (colW + gapX), y = top + cy * sh;
+    const m = M[it.k], s = sev(it.k);
+    g.fillStyle = C.line; g.fillRect(x, y, colW, 1);
+    text(g, it.n, x, y + 14, {s:12, c:C.ink2, b:'middle'});
+    let right = x + colW;
+    const unit = m.unit === '°' ? '' : m.unit, uw = width(g, unit, 11);
+    text(g, unit, right, y + 14, {s:11, c:C.ink2, a:'right', b:'middle'});
+    text(g, fmt(it.k) + (m.unit === '°' ? '°' : ''), right - uw, y + 14, {s:15, w:600, a:'right', b:'middle'});
+    const vw = width(g, fmt(it.k), 15, 600);
+    if (s.color) chip(g, s, right - uw - vw - 10, y + 14);
+    const py = y + 24, ph = sh - 28;
+    const domain = [m.lo, it.extra ? M[it.extra].hi : m.hi];
+    if (it.extra) {
+      spark(g, M[it.extra].h, x, py, colW - 8, ph, domain[0], domain[1], C.ink3, {wash:false, lw:1.5, dot:false});
+      if (ph > 24) text(g, `Hotspot ${fmt(it.extra)}°`, x + 72, y + 14, {s:11, c:C.ink3, b:'middle'});
+    }
+    spark(g, m.h, x, py, colW - 8, ph, domain[0], domain[1], s.color || it.c);
+  });
+  if (axis) {
+    const y = h - 10;
+    for (let c = 0; c < cols; c++) {
+      const x = pad + c * (colW + gapX);
+      text(g, '2 min ago', x, y, {s:11, c:C.ink3, b:'middle'});
+      text(g, 'now', x + colW, y, {s:11, c:C.ink3, a:'right', b:'middle'});
+    }
+  }
+}
+
+/* ---------- D: Readout ---------- */
+function D_readout(g, w, h) {
+  if (h < 84) return strip(g, w, h);
+  const top = titlebar(g, w), pad = 12, gapX = 24;
+  const cols = w >= 760 ? 3 : w >= 520 ? 2 : 1;
+  const colW = (w - pad * 2 - gapX * (cols - 1)) / cols;
+  const secs = [
+    {n:'CPU', d:'Ryzen 7 9800X3D', c:C.cpu, rows:[
+      {l:'Temperature', v:fmt('cpuT')+'°', f:(M.cpuT.v-20)/80, s:sev('cpuT'), p:1},
+      {l:'Load', v:fmt('cpuU')+'%', f:M.cpuU.v/100, p:1},
+      {l:'Clock', v:M.cpuC.v.toFixed(2)+' GHz', f:M.cpuC.v/M.cpuC.hi, p:3},
+      {l:'Power', v:fmt('cpuP')+' W', f:M.cpuP.v/M.cpuP.hi, p:2},
+      {l:'I/O die', v:fmt('iodT')+'°', f:(M.iodT.v-20)/80, s:sev('iodT'), p:4},
+      {cores:1, p:3},
+    ]},
+    {n:'GPU', d:'Radeon RX 7900 XTX', c:C.gpu, rows:[
+      {l:'Temperature', v:fmt('gpuT')+'°', f:(M.gpuT.v-20)/90, s:sev('gpuT'), p:1},
+      {l:'Hotspot', v:fmt('hotT')+'°', f:(M.hotT.v-20)/95, s:sev('hotT'), p:2},
+      {l:'VRAM temp', v:fmt('memT')+'°', f:(M.memT.v-20)/90, s:sev('memT'), p:3},
+      {l:'Load', v:fmt('gpuU')+'%', f:M.gpuU.v/100, p:1},
+      {l:'Clock', v:fmt('gpuC')+' MHz', f:M.gpuC.v/M.gpuC.hi, p:3},
+      {l:'Power', v:fmt('gpuP')+' W', f:M.gpuP.v/M.gpuP.hi, p:2},
+      {l:'Fan', v:fmt('fan')+' rpm', f:M.fan.v/M.fan.hi, p:3},
+    ]},
+    {n:'Memory', d:'', c:C.ram, rows:[
+      {l:'RAM', v:`${M.ram.v.toFixed(1)} / 31.1 GB`, f:M.ram.v/M.ram.hi, c:C.ram, p:1},
+      {l:'VRAM', v:`${M.vram.v.toFixed(1)} / 24 GB`, f:M.vram.v/M.vram.hi, c:C.vram, p:1},
+    ]},
+    {n:'Disk and network', d:'', c:C.net, rows:[
+      {l:'Disk read', v:fmt('dRd')+' MB/s', f:M.dRd.v/400, c:C.disk, p:4},
+      {l:'Disk write', v:fmt('dWr')+' MB/s', f:M.dWr.v/400, c:C.disk, p:4},
+      {l:'Download', v:fmt('nDn')+' MB/s', f:M.nDn.v/100, c:C.net, p:4},
+      {l:'Upload', v:fmt('nUp')+' MB/s', f:M.nUp.v/100, c:C.net, p:4},
+    ]},
+  ];
+  const Rh = h - top - 8;
+  const rowH = w >= 300 ? 23 : 21, headH = 26, coreH = 30;
+  /* Choose the highest detail tier whose rows fit the available height across all columns. */
+  let chosen = null;
+  for (const tier of [4, 3, 2, 1]) {
+    const groups = secs.map(s => ({...s, rows:s.rows.filter(r => r.p <= tier)})).filter(s => s.rows.length);
+    const heights = groups.map(s => headH + s.rows.reduce((a, r) => a + (r.cores ? coreH : rowH), 0) + 4);
+    const total = heights.reduce((a, b) => a + b, 0);
+    if (total / cols <= Rh || tier === 1) { chosen = {groups, heights, total}; break; }
+  }
+  const target = chosen.total / cols; let col = 0, y = top, used = 0;
+  chosen.groups.forEach((sec, si) => {
+    const need = chosen.heights[si];
+    if (used > 0 && col < cols - 1 && (used + need > Rh || used + need * .5 > target)) { col++; used = 0; y = top; }
+    if (used + need > Rh + 4 && used > 0) return;
+    const x = pad + col * (colW + gapX);
+    g.fillStyle = sec.c; g.beginPath(); g.roundRect(x, y + 9, 3, 12, 1.5); g.fill();
+    text(g, sec.n, x + 9, y + 15, {s:12, w:600, b:'middle'});
+    if (sec.d && colW > 230) text(g, sec.d, x + colW, y + 15, {s:11, c:C.ink3, a:'right', b:'middle'});
+    let ry = y + headH;
+    const labelW = Math.min(92, colW * .34), valW = Math.min(104, colW * .34);
+    for (const r of sec.rows) {
+      if (r.cores) {
+        const n = cores.length, gap = 2, bw = (colW - gap * (n - 1)) / n, ch = coreH - 8;
+        cores.forEach((c, i) => {
+          const bx = x + i * (bw + gap);
+          rr(g, bx, ry + 2, bw, ch, 1.5, C.track);
+          const fh = Math.max(2, ch * c.v / 100);
+          rr(g, bx, ry + 2 + ch - fh, bw, fh, 1.5, sec.c);
+        });
+        ry += coreH; continue;
+      }
+      const cy = ry + rowH / 2;
+      text(g, r.l, x, cy, {s:12, c:C.ink2, b:'middle'});
+      text(g, r.v, x + colW, cy, {s:12.5, w:600, a:'right', b:'middle'});
+      const mx = x + labelW, mw = colW - labelW - valW - 8;
+      if (mw > 24) meter(g, mx, cy - 2, mw, 4, r.f, (r.s && r.s.color) || r.c || sec.c);
+      if (r.s && r.s.color) { g.fillStyle = r.s.color; g.beginPath(); g.arc(x + labelW - 8, cy, 3.5, 0, 7); g.fill(); }
+      ry += rowH;
+    }
+    used += need; y += need;
+  });
+}
+
+/* ---------- page assembly ---------- */
+const DESIGNS = [
+  {id:'tiles', t:'A. Tiles', p:'Stat tiles in a grid, ordered by importance. More room adds tiles and enlarges the numbers. Each tile has one job.', f:A_tiles},
+  {id:'dials', t:'B. Dials', p:'CPU and GPU temperature lead as large arc gauges that can be read from across the room, with memory as a footer. Dials stack on tall windows and sit side by side on wide ones.', f:B_dials},
+  {id:'strips', t:'C. Strips', p:'History first: a stack of strip charts on one shared time axis, so a spike in load can be matched to a spike in temperature. More room adds strips and plot height.', f:C_strips},
+  {id:'readout', t:'D. Readout', p:'A dense instrument panel of labelled rows with thin meters, including per-thread load. Most information per pixel, reflowing from one to three columns and dropping low-priority rows as space runs out.', f:D_readout},
+];
+const SIZES = params.get('sizes') === 'extreme'
+  ? [[190, 640, 'Tall and thin'], [1240, 190, 'Banner'], [1240, 760, 'Large']]
+  : [[320, 46, 'Strip'], [250, 220, 'Small'], [340, 470, 'Default'], [720, 380, 'Wide']];
+const root = document.getElementById('root');
+const frames = [];
+for (const d of DESIGNS) {
+  if (params.get('design') && params.get('design') !== d.id) continue;
+  const sec = document.createElement('section');
+  sec.innerHTML = `<h2>${d.t}</h2><p>${d.p}</p><div class="frames"></div>`;
+  const row = sec.querySelector('.frames');
+  for (const [w, h, name] of SIZES) {
+    const fig = document.createElement('figure');
+    const fr = document.createElement('div'); fr.className = 'frame'; fr.style.width = w + 'px'; fr.style.height = h + 'px';
+    const cv = document.createElement('canvas'); fr.append(cv);
+    const cap = document.createElement('figcaption');
+    fig.append(fr, cap); row.append(fig);
+    const fObj = {cv, fr, cap, name, d};
+    frames.push(fObj);
+    new ResizeObserver(() => paint(fObj)).observe(fr);
+  }
+  root.append(sec);
+}
+function paint(o) {
+  const w = o.fr.clientWidth, h = o.fr.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (!w || !h) return;
+  const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (o.cv.width !== bw || o.cv.height !== bh) { o.cv.width = bw; o.cv.height = bh; }
+  const g = o.cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = C.surface; g.fillRect(0, 0, w, h);
+  o.d.f(g, w, h);
+  o.cap.textContent = `${o.name}, ${w} × ${h}`;
+}
+const paintAll = () => frames.forEach(paint);
+paintAll();
+if (!params.has('static')) setInterval(() => { step(); paintAll(); }, 1000);
+document.getElementById('theme').onclick = () => {
+  theme = theme === 'dark' ? 'light' : 'dark'; C = THEMES[theme];
+  document.documentElement.dataset.theme = theme; paintAll();
+};
+document.fonts?.ready.then(paintAll);
+</script>
+</body>
+</html>
