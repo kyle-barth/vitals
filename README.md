@@ -4,6 +4,22 @@ A small, fully resizable sensor monitor for Windows, written in Rust with
 Direct2D. It tracks CPU and GPU temperatures, load, power, memory, disk and
 network in a single 360 KB exe with no runtime dependencies.
 
+<p align="center">
+  <img src="docs/images/default.png" width="340" alt="Vitals at its default size: a grid of tiles showing CPU and GPU temperature, memory, GPU hotspot, load and power, each with a live sparkline">
+</p>
+
+## Download
+
+**[Get the latest release](https://github.com/kyle-barth/vitals/releases/latest)**,
+download `vitals.exe` and run it. There is nothing to install.
+
+Windows 10 or 11 is required. The exe is not code-signed, so SmartScreen may warn
+you the first time. Choose **More info**, then **Run anyway**. Each release is
+built by GitHub Actions from the tagged source, and lists the file's SHA-256 hash
+so you can check your download.
+
+## One window, any size
+
 The window adapts to whatever size you give it:
 
 | Window | Layout |
@@ -12,6 +28,10 @@ The window adapts to whatever size you give it:
 | Narrow and tall, under 240 px wide | A single column of up to 11 rows |
 | Small to medium | A grid of 2 to 4 columns, ordered by importance |
 | Large, at least 820 × 600 | 16 tiles, plus a bar for every CPU thread |
+
+![Vitals at a large size: sixteen tiles with history lines, and a load bar for each of the sixteen CPU threads](docs/images/dashboard.png)
+
+![Vitals as a slim strip, showing CPU, GPU and hotspot temperatures with RAM and VRAM use on one line](docs/images/strip.png)
 
 ## Using it
 
@@ -38,8 +58,8 @@ once a value is 3° below the threshold, so it does not flicker.
 
 ## CPU temperature
 
-Windows has no standard API for CPU temperature, and this PC exposes no ACPI
-thermal zones, so Vitals reads what AMD provides:
+Windows has no standard API for CPU temperature, so Vitals reads what AMD
+provides:
 
 - **Without admin rights**, the CPU tile shows the **I/O die** temperature, from
   the integrated GPU's sensors. It is labelled "CPU I/O die" and is not a core
@@ -68,6 +88,12 @@ reading per second down a one-way pipe:
 - It loads AMD's DLL by a full path from Program Files, which only
   administrators can write to, and connects to the pipe anonymously so that the
   unelevated pipe owner cannot impersonate it.
+- It accepts only a numeric pipe name, and refuses anything that is not a pipe.
+- The UI accepts readings only from the process it started.
+
+The exe also resolves its DLLs from System32 only. Windows would otherwise check
+the exe's own folder first, which is often Downloads, so a malicious DLL sitting
+there could run inside the app, and with admin rights in the helper.
 
 ## Hardware support
 
@@ -111,6 +137,28 @@ The exe is written to `target/release/vitals.exe`. If the linker reports
 `LNK1104` for a build script, the project path is too long for Windows. Build
 from a shorter path, or set `CARGO_TARGET_DIR` to one.
 
+## Releases
+
+Versions follow [Semantic Versioning](https://semver.org), and each one is listed
+in [CHANGELOG.md](CHANGELOG.md). To publish a new version:
+
+1. Update the version in `Cargo.toml`, `assets/app.rc` and `assets/app.manifest`.
+   The build fails if they disagree.
+2. Add a section for it to `CHANGELOG.md`, and merge to `main`.
+3. Tag that commit and push the tag:
+
+```bash
+git tag -a v0.2.0 -m "Vitals 0.2.0"
+```
+
+```bash
+git push origin v0.2.0
+```
+
+[The release workflow](.github/workflows/release.yml) then lints, tests, builds
+and publishes the exe. It refuses to run if the tag and `Cargo.toml` disagree, or
+if `CHANGELOG.md` has no section for that version.
+
 ## Layout of the code
 
 | Path | Purpose |
@@ -125,3 +173,8 @@ from a shorter path, or set `CARGO_TARGET_DIR` to one.
 | `src/helper.rs` | The elevated helper and the UI's link to it |
 | `src/settings.rs` | Saved preferences |
 | `designs/` | The original HTML design directions |
+| `docs/images/` | The screenshots in this README |
+
+## License
+
+Released under the [MIT License](LICENSE).
