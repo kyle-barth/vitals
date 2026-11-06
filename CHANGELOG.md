@@ -5,6 +5,8 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-06
+
 ### Added
 
 - A Busy list along the bottom of the window, showing apps that are using a lot
