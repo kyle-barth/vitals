@@ -5,6 +5,8 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
 ### Added
 
 - An Apps tab with every app in a table, showing CPU, memory, GPU, video memory
