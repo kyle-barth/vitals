@@ -5,6 +5,8 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
 ### Added
 
 - A Specs tab that lists the CPU, GPU, motherboard, memory, storage, displays
