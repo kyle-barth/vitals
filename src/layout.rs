@@ -11,6 +11,7 @@
 //! is said about each one, so it never changes which tiles appear.
 
 use crate::apps::{COLUMNS, SIMPLE_COLUMNS, SortKey};
+use crate::metrics::Absent;
 use crate::metrics::MetricId::{self, *};
 
 pub const TITLE_H: f32 = 28.0;
@@ -38,10 +39,38 @@ const KEEP_W: f32 = 42.0;
 /// The grid must show at least this many tiles, otherwise the strip is better.
 const MIN_TILES: usize = 4;
 
-/// Below this width, minimize and maximize step aside for the tabs.
-const ALL_BUTTONS_W: f32 = 230.0;
-const TABS: [(Page, f32); 2] = [(Page::Vitals, 46.0), (Page::Apps, 40.0)];
+/// Below this width, minimize and maximize step aside for the tabs, and the
+/// tabs and buttons that remain draw closer together.
+const ALL_BUTTONS_W: f32 = 280.0;
+const TABS: [(Page, f32); 3] = [
+    (Page::Vitals, 46.0),
+    (Page::Apps, 40.0),
+    (Page::Specs, 44.0),
+];
+const COMPACT_TABS: [(Page, f32); 3] = [
+    (Page::Vitals, 40.0),
+    (Page::Apps, 34.0),
+    (Page::Specs, 38.0),
+];
 const TABS_X: f32 = 4.0;
+
+/// The Specs page needs its title bar, its copy band and at least one row.
+const SPECS_MIN_H: f32 = 130.0;
+const SPECS_BAND_H: f32 = 30.0;
+/// Wide enough for "Couldn't copy" beside its glyph, so the button keeps one
+/// size whatever it says.
+const COPY_W: f32 = 112.0;
+const COPY_H: f32 = 24.0;
+/// From this width, the CPU side and the GPU side of the PC get a column each.
+const SPECS_COLUMNS_W: f32 = 670.0;
+/// Narrower than this, a part's label goes above its name rather than beside it.
+const SPECS_STACK_BELOW: f32 = 250.0;
+/// The column of part labels, which fits "Motherboard".
+pub const SPECS_LABEL_W: f32 = 80.0;
+pub const SPECS_ITEM_H: f32 = 38.0;
+pub const SPECS_FACT_H: f32 = 20.0;
+/// Details need room for a label and a value beside the part's own label.
+const SPECS_DETAIL_MIN_W: f32 = 400.0;
 
 const TABLE_MIN_H: f32 = 110.0;
 const TABLE_SUMMARY_MIN_H: f32 = 180.0;
@@ -192,6 +221,52 @@ const ROWS: [MetricId; 11] = [
     GpuFan,
 ];
 
+/// Readings that fill the gap left by something this PC cannot report, in the
+/// order they are used.
+const SPARES: [MetricId; 6] = [GpuClock, CpuClock, DiskRead, DiskWrite, Download, Upload];
+
+/// Close relatives of a metric, tried before the spares, so that a CPU tile is
+/// replaced by a CPU tile and a GPU tile by a GPU tile where possible.
+fn stand_ins(metric: MetricId) -> &'static [MetricId] {
+    match metric {
+        CpuTemp | CpuPower => &[CpuClock],
+        GpuHotspot | VramTemp => &[GpuClock],
+        GpuFan => &[GpuFanPercent],
+        _ => &[],
+    }
+}
+
+/// `order` with each metric this PC cannot report swapped, in its place, for a
+/// stand-in or a spare. A stand-in that was further down moves up rather than
+/// appearing twice. With nothing absent, this is `order` unchanged.
+pub fn fill(order: &[MetricId], absent: Absent) -> Vec<MetricId> {
+    let mut shown: Vec<MetricId> = Vec::with_capacity(order.len());
+    for &metric in order {
+        if shown.contains(&metric) {
+            continue;
+        }
+        if !absent.contains(metric) {
+            shown.push(metric);
+            continue;
+        }
+        let pick = stand_ins(metric)
+            .iter()
+            .chain(&SPARES)
+            .copied()
+            .find(|m| !absent.contains(*m) && !shown.contains(m));
+        shown.extend(pick);
+    }
+    for spare in SPARES {
+        if shown.len() >= order.len() {
+            break;
+        }
+        if !absent.contains(spare) && !shown.contains(&spare) {
+            shown.push(spare);
+        }
+    }
+    shown
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -224,18 +299,31 @@ pub enum Mode {
     Rows,
     Tiles,
     Table,
+    Specs,
 }
 
-/// Which of the two tabs is open.
+/// Which tab is open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
     #[default]
     Vitals,
     Apps,
+    Specs,
+}
+
+/// What the Specs page needs to know about a part to make room for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartShape {
+    /// How many devices it lists, such as drives.
+    pub items: usize,
+    /// How many label and value pairs it has.
+    pub facts: usize,
+    /// Whether it belongs on the GPU's side when there are two columns.
+    pub right: bool,
 }
 
 /// Everything besides the window's size that changes its layout.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     /// How many busy apps want a row.
     pub apps: usize,
@@ -244,6 +332,10 @@ pub struct Options {
     pub page: Page,
     pub simple: bool,
     pub sort: SortKey,
+    /// What this PC cannot report, which the tiles leave out.
+    pub absent: Absent,
+    /// The parts on the Specs page, once they have been read.
+    pub parts: Vec<PartShape>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -275,6 +367,131 @@ pub struct Layout {
     /// The page actually showing. A strip has no room for Apps, whatever is chosen.
     pub page: Page,
     pub table: Option<Table>,
+    pub specs: Option<SpecsPage>,
+}
+
+/// The Specs page: a band with the copy button, then a row for each part.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecsPage {
+    pub band: Rect,
+    pub copy: Rect,
+    /// Where the rows go.
+    pub view: Rect,
+    pub column_w: f32,
+    /// Each column's left edge, and its parts as (index, height).
+    pub columns: Vec<(f32, Vec<(usize, f32)>)>,
+    /// Labels sit above names, in a narrow window.
+    pub stacked: bool,
+    /// Every part shows its details, because they all fit.
+    pub detailed: bool,
+}
+
+impl SpecsPage {
+    /// The parts on screen, and where they go, with `scroll` rows hidden at
+    /// the top of each column. Only whole rows are shown, so no text is cut.
+    pub fn visible(&self, scroll: usize) -> Vec<(usize, Rect)> {
+        let mut shown = Vec::new();
+        for (x, rows) in &self.columns {
+            let mut y = self.view.y;
+            for &(index, h) in rows.iter().skip(scroll) {
+                let room = self.view.bottom() - y;
+                if h > room + 0.01 {
+                    // A part taller than the whole view, such as a long list
+                    // of drives in a short window, still shows when it is at
+                    // the top, cut to the devices that fit.
+                    if y == self.view.y && room > 0.0 {
+                        shown.push((index, Rect::new(*x, y, self.column_w, room)));
+                    }
+                    break;
+                }
+                shown.push((index, Rect::new(*x, y, self.column_w, h)));
+                y += h + GAP;
+            }
+        }
+        shown
+    }
+
+    /// The most rows that can be scrolled away before the last one shows.
+    pub fn max_scroll(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|(_, rows)| {
+                (0..rows.len())
+                    .find(|&skip| column_height(&rows[skip..]) <= self.view.h + 0.01)
+                    .unwrap_or(rows.len().saturating_sub(1))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Rows in the longest column, for the mark that shows the scroll position.
+    pub fn longest(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|(_, rows)| rows.len())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+fn column_height(rows: &[(usize, f32)]) -> f32 {
+    let gaps = rows.len().saturating_sub(1) as f32 * GAP;
+    rows.iter().map(|(_, h)| h).sum::<f32>() + gaps
+}
+
+/// A part's height: a line pair per device, or its name and details.
+fn part_height(shape: PartShape, stacked: bool, detailed: bool) -> f32 {
+    if detailed && shape.items == 1 && shape.facts > 0 {
+        return 44.0 + shape.facts as f32 * SPECS_FACT_H;
+    }
+    let items = shape.items.max(1) as f32 * SPECS_ITEM_H;
+    if stacked { 22.0 + items } else { 10.0 + items }
+}
+
+fn specs_page(width: f32, height: f32, parts: &[PartShape], simple: bool) -> SpecsPage {
+    let inner = width - PAD * 2.0;
+    let band = Rect::new(PAD, TITLE_H, inner, SPECS_BAND_H);
+    let copy = Rect::new(
+        width - PAD - COPY_W,
+        TITLE_H + (SPECS_BAND_H - COPY_H) / 2.0,
+        COPY_W,
+        COPY_H,
+    );
+    let top = band.bottom();
+    let view = Rect::new(PAD, top, inner, (height - PAD - top).max(0.0));
+    let two = width >= SPECS_COLUMNS_W;
+    let column_w = if two { (inner - GAP) / 2.0 } else { inner };
+    let stacked = column_w < SPECS_STACK_BELOW;
+    // Each column stacks on its own, so a long list of drives only makes its
+    // own column longer.
+    let arrange = |detailed: bool| {
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for (index, shape) in parts.iter().enumerate() {
+            let h = part_height(*shape, stacked, detailed);
+            if two && shape.right {
+                right.push((index, h));
+            } else {
+                left.push((index, h));
+            }
+        }
+        let mut columns = vec![(PAD, left)];
+        if two {
+            columns.push((PAD + column_w + GAP, right));
+        }
+        columns
+    };
+    let can_detail = !simple && !stacked && column_w >= SPECS_DETAIL_MIN_W;
+    let full = arrange(true);
+    let detailed = can_detail && full.iter().all(|(_, rows)| column_height(rows) <= view.h);
+    SpecsPage {
+        band,
+        copy,
+        view,
+        column_w,
+        columns: if detailed { full } else { arrange(false) },
+        stacked,
+        detailed,
+    }
 }
 
 /// The Apps page.
@@ -371,15 +588,24 @@ pub fn compute(width: f32, height: f32, options: Options) -> Layout {
         let mut layout = blank(width, height);
         layout.mode = Mode::Table;
         layout.page = Page::Apps;
-        layout.table = Some(table(width, height, options));
+        layout.table = Some(table(width, height, &options));
         layout.buttons = buttons(width, Mode::Table);
-        layout.tabs = tabs();
+        layout.tabs = tabs(width);
+        return layout;
+    }
+    if options.page == Page::Specs && height >= SPECS_MIN_H {
+        let mut layout = blank(width, height);
+        layout.mode = Mode::Specs;
+        layout.page = Page::Specs;
+        layout.specs = Some(specs_page(width, height, &options.parts, options.simple));
+        layout.buttons = buttons(width, Mode::Specs);
+        layout.tabs = tabs(width);
         return layout;
     }
     vitals(width, height, options)
 }
 
-fn table(width: f32, height: f32, options: Options) -> Table {
+fn table(width: f32, height: f32, options: &Options) -> Table {
     let tall = height >= TABLE_SUMMARY_MIN_H;
     let (left, inner) = (PAD, width - PAD * 2.0);
     let summary = tall.then(|| Rect::new(left, TITLE_H, inner, TABLE_SUMMARY_H));
@@ -416,6 +642,7 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
         apps,
         frozen,
         simple,
+        absent,
         ..
     } = options;
     let columns = if width >= APP_COLUMNS_W && apps >= 2 {
@@ -426,7 +653,7 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
     for count in (1..=apps.min(MAX_APP_ROWS * columns)).rev() {
         let rows = count.div_ceil(columns);
         let band = rows as f32 * APP_ROW_H + (rows - 1) as f32 * APP_ROW_GAP + GAP;
-        let mut layout = arrange(width, height, band, simple);
+        let mut layout = arrange(width, height, band, simple, absent);
         if layout.mode != Mode::Strip {
             let cell_w = (width - PAD * 2.0 - GAP * (columns - 1) as f32) / columns as f32;
             let top = height - PAD - (rows as f32 * (APP_ROW_H + APP_ROW_GAP) - APP_ROW_GAP);
@@ -444,7 +671,7 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
             return layout;
         }
     }
-    let mut layout = arrange(width, height, 0.0, simple);
+    let mut layout = arrange(width, height, 0.0, simple, absent);
     if layout.mode == Mode::Strip && apps > 0 {
         if height >= STRIP_TWO_LINES_H {
             let row_h = 26.0;
@@ -498,12 +725,18 @@ fn blank(width: f32, height: f32) -> Layout {
         tabs: Vec::new(),
         page: Page::Vitals,
         table: None,
+        specs: None,
     }
 }
 
-fn tabs() -> Vec<(Page, Rect)> {
+fn tabs(window_w: f32) -> Vec<(Page, Rect)> {
+    let set = if window_w < ALL_BUTTONS_W {
+        &COMPACT_TABS
+    } else {
+        &TABS
+    };
     let mut x = TABS_X;
-    TABS.iter()
+    set.iter()
         .map(|&(page, width)| {
             let rect = Rect::new(x, 0.0, width, TITLE_H);
             x += width;
@@ -512,14 +745,15 @@ fn tabs() -> Vec<(Page, Rect)> {
         .collect()
 }
 
-fn arrange(width: f32, height: f32, band: f32, simple: bool) -> Layout {
+fn arrange(width: f32, height: f32, band: f32, simple: bool, absent: Absent) -> Layout {
     let mut layout = blank(width, height);
     let body = (height - TITLE_H - PAD - band).max(0.0);
     if width < ROWS_BELOW_WIDTH {
-        let count = (((body + ROW_GAP) / (MIN_ROW_H + ROW_GAP)).floor() as usize).min(ROWS.len());
+        let order = fill(&ROWS, absent);
+        let count = (((body + ROW_GAP) / (MIN_ROW_H + ROW_GAP)).floor() as usize).min(order.len());
         if count >= MIN_TILES {
             layout.mode = Mode::Rows;
-            grid(&mut layout, &ROWS[..count], 1, body, ROW_GAP);
+            grid(&mut layout, &order[..count], 1, body, ROW_GAP);
         }
     } else {
         let large = width >= LARGE_W && height >= LARGE_H;
@@ -531,13 +765,18 @@ fn arrange(width: f32, height: f32, band: f32, simple: bool) -> Layout {
         } else {
             (&TILES_2, 2)
         };
+        let order = fill(order, absent);
         let grid_h = if threads {
             body - THREADS_H - GAP
         } else {
             body
         };
         let rows = ((grid_h + GAP) / (MIN_TILE_H + GAP)).floor().max(0.0) as usize;
-        let count = order.len().min(rows * cols);
+        let mut count = order.len().min(rows * cols);
+        // A short last row reads as tiles that failed to load.
+        if count > cols {
+            count -= count % cols;
+        }
         if count >= MIN_TILES {
             layout.mode = Mode::Tiles;
             grid(&mut layout, &order[..count], cols, grid_h, GAP);
@@ -549,7 +788,7 @@ fn arrange(width: f32, height: f32, band: f32, simple: bool) -> Layout {
     }
     layout.buttons = buttons(width, layout.mode);
     if layout.mode != Mode::Strip {
-        layout.tabs = tabs();
+        layout.tabs = tabs(width);
     }
     layout
 }
@@ -577,6 +816,8 @@ fn grid(layout: &mut Layout, order: &[MetricId], cols: usize, grid_h: f32, gap: 
 fn buttons(width: f32, mode: Mode) -> Vec<(Button, Rect)> {
     let (size, height) = if mode == Mode::Strip {
         (24.0, 24.0)
+    } else if width < ALL_BUTTONS_W {
+        (24.0, TITLE_H)
     } else {
         (28.0, TITLE_H)
     };
@@ -625,25 +866,38 @@ const STRIP_MIN_SIZE: f32 = 14.0;
 const STRIP_TWO_LINES_H: f32 = 64.0;
 
 /// Fits the strip into `width`, shrinking the text before dropping anything.
-/// VRAM goes first, then RAM. The temperatures are never dropped.
+/// VRAM goes first, then RAM. The temperatures are never dropped, though the
+/// hotspot is left out on a GPU that cannot report it.
 /// `line_width` measures one line of items at a given text size.
 pub fn plan_strip(
     width: f32,
     height: f32,
+    absent: Absent,
     line_width: impl Fn(&[StripItem], f32) -> f32,
 ) -> StripPlan {
     use StripItem::*;
-    let candidates: [&[StripItem]; 3] = [
-        &[Cpu, Gpu, Hotspot, Ram, Vram],
-        &[Cpu, Gpu, Hotspot, Ram],
-        &[Cpu, Gpu, Hotspot],
+    let kept = |items: &[StripItem]| -> Vec<StripItem> {
+        items
+            .iter()
+            .copied()
+            .filter(|i| *i != Hotspot || !absent.contains(GpuHotspot))
+            .collect()
+    };
+    let candidates = [
+        kept(&[Cpu, Gpu, Hotspot, Ram, Vram]),
+        kept(&[Cpu, Gpu, Hotspot, Ram]),
+        kept(&[Cpu, Gpu, Hotspot]),
     ];
     let two_lines = height >= STRIP_TWO_LINES_H;
     let line_h = if two_lines { height / 2.0 } else { height };
     let start = (line_h * 0.46).clamp(STRIP_MIN_SIZE, 26.0);
     let split = |items: &[StripItem]| -> Vec<Vec<StripItem>> {
         if two_lines {
-            let (a, b) = items.split_at(3);
+            let processors = items
+                .iter()
+                .take_while(|i| matches!(i, Cpu | Gpu | Hotspot))
+                .count();
+            let (a, b) = items.split_at(processors);
             [a.to_vec(), b.to_vec()]
                 .into_iter()
                 .filter(|l| !l.is_empty())
@@ -653,7 +907,7 @@ pub fn plan_strip(
         }
     };
     let available = width - PAD * 2.0;
-    for items in candidates {
+    for items in &candidates {
         let lines = split(items);
         let mut size = start;
         loop {
@@ -668,7 +922,7 @@ pub fn plan_strip(
     }
     StripPlan {
         size: STRIP_MIN_SIZE,
-        lines: split(candidates[2]),
+        lines: split(&candidates[2]),
     }
 }
 
@@ -836,7 +1090,7 @@ mod tests {
 
     #[test]
     fn strip_shrinks_text_before_dropping_anything() {
-        let plan = plan_strip(320.0, 46.0, measured(60.5));
+        let plan = plan_strip(320.0, 46.0, Absent::default(), measured(60.5));
         assert_eq!(plan.size, STRIP_MIN_SIZE);
         assert_eq!(plan.lines[0].len(), 5);
     }
@@ -844,18 +1098,28 @@ mod tests {
     #[test]
     fn strip_drops_vram_then_ram_but_never_temperatures() {
         use StripItem::*;
-        let dropped_one = plan_strip(320.0, 46.0, measured(70.0));
+        let dropped_one = plan_strip(320.0, 46.0, Absent::default(), measured(70.0));
         assert_eq!(dropped_one.lines[0], vec![Cpu, Gpu, Hotspot, Ram]);
-        let dropped_two = plan_strip(240.0, 46.0, measured(70.0));
+        let dropped_two = plan_strip(240.0, 46.0, Absent::default(), measured(70.0));
         assert_eq!(dropped_two.lines[0], vec![Cpu, Gpu, Hotspot]);
-        let too_tight = plan_strip(100.0, 46.0, measured(70.0));
+        let too_tight = plan_strip(100.0, 46.0, Absent::default(), measured(70.0));
         assert_eq!(too_tight.lines[0], vec![Cpu, Gpu, Hotspot]);
     }
 
     #[test]
     fn strip_wraps_to_two_lines_when_tall_enough() {
-        let plan = plan_strip(320.0, 70.0, measured(58.0));
+        let plan = plan_strip(320.0, 70.0, Absent::default(), measured(58.0));
         assert_eq!(plan.lines.len(), 2);
+    }
+
+    #[test]
+    fn a_gpu_without_a_hotspot_sensor_leaves_it_out_of_the_strip() {
+        use StripItem::*;
+        let absent = Absent::default().with(GpuHotspot);
+        let plan = plan_strip(320.0, 46.0, absent, measured(40.0));
+        assert_eq!(plan.lines[0], vec![Cpu, Gpu, Ram, Vram]);
+        let two = plan_strip(320.0, 70.0, absent, measured(40.0));
+        assert_eq!(two.lines, vec![vec![Cpu, Gpu], vec![Ram, Vram]]);
     }
 
     fn overlaps(a: Rect, b: Rect) -> bool {
@@ -870,7 +1134,7 @@ mod tests {
         for (w, h) in sizes() {
             let quiet = with_apps(w, h, 0, false);
             assert!(quiet.app_rows.is_empty(), "{w}x{h}");
-            let again = arrange(w, h, 0.0, false);
+            let again = arrange(w, h, 0.0, false, Absent::default());
             assert_eq!(quiet.mode, again.mode, "{w}x{h}");
             assert_eq!(quiet.cells, again.cells, "{w}x{h}");
             assert_eq!(quiet.threads, again.threads, "{w}x{h}");
@@ -999,7 +1263,7 @@ mod tests {
             ..Default::default()
         };
         for (w, h) in sizes() {
-            let (full, simple) = (plain(w, h), compute(w, h, options));
+            let (full, simple) = (plain(w, h), compute(w, h, options.clone()));
             if full.threads.is_none() {
                 assert_eq!(full.cells.len(), simple.cells.len(), "{w}x{h}");
             }
@@ -1151,6 +1415,226 @@ mod tests {
         assert_eq!(l.tab_at(20.0, 14.0), Some(Page::Vitals));
         assert_eq!(l.tab_at(70.0, 14.0), Some(Page::Apps));
         assert_eq!(l.tab_at(200.0, 14.0), None);
+    }
+
+    /// What an Intel CPU with an NVIDIA GPU cannot report.
+    fn intel_nvidia() -> Absent {
+        [CpuTemp, IoDieTemp, CpuPower, GpuHotspot, VramTemp, GpuFan]
+            .into_iter()
+            .fold(Absent::default(), Absent::with)
+    }
+
+    fn on(absent: Absent, width: f32, height: f32) -> Layout {
+        let options = Options {
+            absent,
+            ..Default::default()
+        };
+        compute(width, height, options)
+    }
+
+    #[test]
+    fn nothing_absent_leaves_every_order_alone() {
+        for order in [&TILES_2[..], &TILES_3, &TILES_4, &ROWS] {
+            assert_eq!(fill(order, Absent::default()), order);
+        }
+    }
+
+    #[test]
+    fn absent_metrics_never_get_a_tile_at_any_size() {
+        let absent = intel_nvidia();
+        for (w, h) in sizes() {
+            for c in on(absent, w, h).cells {
+                assert!(!absent.contains(c.metric), "{w}x{h} {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn stand_ins_keep_the_cpu_left_and_the_gpu_right() {
+        let l = on(intel_nvidia(), 340.0, 520.0);
+        let x = |m: MetricId| l.cells.iter().find(|c| c.metric == m).unwrap().rect.x;
+        assert_eq!(l.cells[0].metric, CpuClock);
+        assert!(x(CpuClock) < x(GpuTemp));
+        assert!(x(CpuLoad) < x(GpuLoad));
+        assert!(x(GpuClock) > x(Memory));
+        assert!(l.shows(GpuFanPercent));
+    }
+
+    #[test]
+    fn a_stand_in_further_down_moves_up_rather_than_appearing_twice() {
+        let order = fill(&TILES_4, intel_nvidia());
+        assert_eq!(order[0], CpuClock);
+        let mut seen = order.clone();
+        seen.sort_by_key(|m| *m as usize);
+        seen.dedup();
+        assert_eq!(seen.len(), order.len());
+    }
+
+    #[test]
+    fn a_grid_short_of_metrics_never_leaves_a_ragged_last_row() {
+        let absent = intel_nvidia();
+        for (w, h) in sizes() {
+            let l = on(absent, w, h);
+            if l.mode != Mode::Tiles {
+                continue;
+            }
+            let columns = {
+                let mut xs: Vec<i32> = l.cells.iter().map(|c| c.rect.x as i32).collect();
+                xs.sort_unstable();
+                xs.dedup();
+                xs.len()
+            };
+            assert_eq!(l.cells.len() % columns, 0, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn cells_stay_apart_and_inside_with_metrics_missing() {
+        let absent = intel_nvidia();
+        for (w, h) in sizes() {
+            let l = on(absent, w, h);
+            for (i, a) in l.cells.iter().enumerate() {
+                assert!(a.rect.right() <= w + 0.01 && a.rect.bottom() <= h + 0.01);
+                for b in &l.cells[i + 1..] {
+                    assert!(!overlaps(a.rect, b.rect), "{w}x{h}: {a:?} {b:?}");
+                }
+            }
+        }
+    }
+
+    /// The parts of the PC these were written on: an i7 with an RTX card,
+    /// two drives and one display.
+    fn this_pc_parts() -> Vec<PartShape> {
+        let part = |items, facts, right| PartShape {
+            items,
+            facts,
+            right,
+        };
+        vec![
+            part(1, 4, false),
+            part(1, 6, true),
+            part(1, 3, false),
+            part(1, 4, false),
+            part(2, 2, false),
+            part(1, 2, true),
+            part(1, 3, true),
+        ]
+    }
+
+    fn specs(width: f32, height: f32, simple: bool) -> Layout {
+        let options = Options {
+            page: Page::Specs,
+            simple,
+            parts: this_pc_parts(),
+            ..Default::default()
+        };
+        compute(width, height, options)
+    }
+
+    #[test]
+    fn the_specs_page_keeps_every_row_whole_and_inside_at_every_size_and_scroll() {
+        for (w, h) in sizes().filter(|(w, _)| *w >= 190.0) {
+            let l = specs(w, h, false);
+            let Some(page) = &l.specs else {
+                assert_ne!(l.mode, Mode::Specs, "{w}x{h}");
+                continue;
+            };
+            assert!(
+                page.copy.x >= page.band.x && page.copy.right() <= w - PAD + 0.01,
+                "{w}x{h}"
+            );
+            for scroll in 0..=page.max_scroll() {
+                let rows = page.visible(scroll);
+                assert!(!rows.is_empty(), "{w}x{h} scrolled {scroll}");
+                for (i, (_, a)) in rows.iter().enumerate() {
+                    assert!(
+                        a.y >= page.view.y && a.bottom() <= page.view.bottom() + 0.01,
+                        "{w}x{h}"
+                    );
+                    assert!(a.x >= 0.0 && a.right() <= w + 0.01, "{w}x{h}");
+                    for (_, b) in &rows[i + 1..] {
+                        assert!(!overlaps(*a, *b), "{w}x{h}: {a:?} {b:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_window_shows_every_part_in_one_column() {
+        let l = specs(340.0, 520.0, false);
+        let page = l.specs.as_ref().unwrap();
+        assert_eq!(page.columns.len(), 1);
+        assert_eq!(page.visible(0).len(), 7);
+        assert_eq!(page.max_scroll(), 0);
+        assert!(!page.stacked && !page.detailed);
+    }
+
+    #[test]
+    fn a_large_window_puts_the_gpu_side_on_the_right_with_details() {
+        let page = specs(1240.0, 760.0, false).specs.unwrap();
+        assert_eq!(page.columns.len(), 2);
+        assert!(page.detailed);
+        let right: Vec<usize> = page.columns[1].1.iter().map(|(i, _)| *i).collect();
+        assert_eq!(right, [1, 5, 6]);
+        assert!(
+            !specs(1240.0, 760.0, true).specs.unwrap().detailed,
+            "Simple keeps it brief"
+        );
+    }
+
+    #[test]
+    fn a_narrow_window_puts_labels_above_names() {
+        assert!(specs(200.0, 520.0, false).specs.unwrap().stacked);
+        assert!(!specs(280.0, 520.0, false).specs.unwrap().stacked);
+    }
+
+    #[test]
+    fn a_short_window_scrolls_by_whole_rows_down_to_the_last() {
+        let page = specs(340.0, 220.0, false).specs.unwrap();
+        assert!(page.max_scroll() > 0);
+        let last = page.visible(page.max_scroll());
+        assert_eq!(last.last().map(|(i, _)| *i), Some(6));
+        assert!(page.visible(0).len() < 7);
+    }
+
+    #[test]
+    fn a_part_taller_than_the_window_still_shows_when_it_reaches_the_top() {
+        let mut parts = this_pc_parts();
+        parts[4].items = 6;
+        let options = Options {
+            page: Page::Specs,
+            parts,
+            ..Default::default()
+        };
+        let page = compute(209.0, 140.0, options).specs.unwrap();
+        for scroll in 0..=page.max_scroll() {
+            assert!(!page.visible(scroll).is_empty(), "scrolled {scroll}");
+        }
+    }
+
+    #[test]
+    fn a_very_short_window_shows_the_strip_on_the_specs_page_too() {
+        let l = specs(340.0, 100.0, false);
+        assert_eq!(l.mode, Mode::Strip);
+        assert!(l.specs.is_none());
+    }
+
+    #[test]
+    fn three_tabs_never_reach_the_buttons_on_any_page() {
+        for page in [Page::Vitals, Page::Apps, Page::Specs] {
+            for w in (190..=1600).step_by(1) {
+                let options = Options {
+                    page,
+                    ..Default::default()
+                };
+                let l = compute(w as f32, 470.0, options);
+                let tabs_end = l.tabs.last().map_or(0.0, |(_, r)| r.right());
+                for (button, r) in &l.buttons {
+                    assert!(tabs_end <= r.x, "{page:?} {button:?} at {w}");
+                }
+            }
+        }
     }
 
     #[test]

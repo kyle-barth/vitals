@@ -24,9 +24,12 @@ pub enum MetricId {
     DiskWrite,
     Download,
     Upload,
+    GpuClock,
+    /// Fan speed as a share of its maximum, for GPUs that do not report rpm.
+    GpuFanPercent,
 }
 
-pub const METRIC_COUNT: usize = 17;
+pub const METRIC_COUNT: usize = 19;
 
 pub const ALL: [MetricId; METRIC_COUNT] = [
     MetricId::CpuTemp,
@@ -46,7 +49,25 @@ pub const ALL: [MetricId; METRIC_COUNT] = [
     MetricId::DiskWrite,
     MetricId::Download,
     MetricId::Upload,
+    MetricId::GpuClock,
+    MetricId::GpuFanPercent,
 ];
+
+/// Metrics this PC cannot report at all, as opposed to a reading that is missing
+/// for a moment. The layout puts something useful in their place rather than a
+/// tile that would only ever show a dash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Absent(u32);
+
+impl Absent {
+    pub const fn with(self, id: MetricId) -> Self {
+        Self(self.0 | 1 << id as u32)
+    }
+
+    pub const fn contains(self, id: MetricId) -> bool {
+        self.0 & (1 << id as u32) != 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Unit {
@@ -173,6 +194,12 @@ impl MetricId {
                 Unit::MegabytesPerSecond,
                 Scale::FromZero { min_top: 1.0 },
             ),
+            MetricId::GpuClock => plain(
+                "GPU clock",
+                Unit::Gigahertz,
+                Scale::FromZero { min_top: 1.0 },
+            ),
+            MetricId::GpuFanPercent => plain("GPU fan", Unit::Percent, PERCENT),
         }
     }
 
@@ -197,6 +224,7 @@ pub struct Snapshot {
     pub vram_total_gb: Option<f32>,
     pub threads: Vec<f32>,
     pub core: CoreStatus,
+    pub absent: Absent,
     pub apps: Vec<BusyApp>,
     pub table: Vec<AppRow>,
 }
@@ -209,6 +237,7 @@ impl Default for Snapshot {
             vram_total_gb: None,
             threads: Vec::new(),
             core: CoreStatus::Off,
+            absent: Absent::default(),
             apps: Vec::new(),
             table: Vec::new(),
         }
@@ -253,6 +282,8 @@ pub struct Monitor {
     pub vram_total_gb: Option<f32>,
     pub threads: Vec<f32>,
     pub core: CoreStatus,
+    /// What this PC cannot report, so the layout can leave it out.
+    pub absent: Absent,
     pub apps: Vec<BusyApp>,
     /// Every app, while the Apps view is open.
     pub table: Vec<AppRow>,
@@ -283,6 +314,7 @@ impl Monitor {
         self.vram_total_gb = snapshot.vram_total_gb.or(self.vram_total_gb);
         self.threads = snapshot.threads;
         self.core = snapshot.core;
+        self.absent = snapshot.absent;
         self.apps = snapshot.apps;
         self.table = snapshot.table;
     }

@@ -78,6 +78,7 @@ impl Settings {
                 "core_temp" => settings.core_temp = flag,
                 "simple" => settings.simple = flag,
                 "page" if value == "apps" => settings.page = Page::Apps,
+                "page" if value == "specs" => settings.page = Page::Specs,
                 "sort" => {
                     if let Some((key, direction)) = value.split_once(',') {
                         if let Some(key) = SortKey::from_id(key) {
@@ -110,8 +111,10 @@ impl Settings {
         text += &format!("always_on_top={}\n", self.always_on_top as u8);
         text += &format!("core_temp={}\n", self.core_temp as u8);
         text += &format!("simple={}\n", self.simple as u8);
-        if self.page == Page::Apps {
-            text += "page=apps\n";
+        match self.page {
+            Page::Apps => text += "page=apps\n",
+            Page::Specs => text += "page=specs\n",
+            Page::Vitals => {}
         }
         let direction = if self.sort.descending { "down" } else { "up" };
         text += &format!("sort={},{direction}\n", self.sort.key.id());
@@ -142,6 +145,15 @@ mod tests {
             your_size: Some((254, 661)),
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
+    }
+
+    #[test]
+    fn the_specs_page_is_remembered() {
+        let settings = Settings {
+            page: Page::Specs,
+            ..Default::default()
+        };
+        assert_eq!(Settings::parse(&settings.serialize()).page, Page::Specs);
     }
 
     #[test]

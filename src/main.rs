@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod apps;
+mod clipboard;
 mod gfx;
 mod helper;
 mod history;
@@ -13,6 +14,7 @@ mod metrics;
 mod sensors;
 mod settings;
 mod severity;
+mod specs;
 mod ui;
 mod window;
 

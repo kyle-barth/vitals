@@ -24,6 +24,7 @@ A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of 
 - 🚦 **Warnings:** Warm adds a label, Hot tints the tile and Critical turns it red. Serious ones also reach the title bar and taskbar, so you can see them while a game covers the window.
 - 🔥 **Busy apps:** only shown when an app is using a lot, with End and a "not responding" warning
 - 📋 **Apps view:** every app in a sortable table, like Task Manager
+- 🧾 **Specs:** what's in the PC, from CPU to Windows version, with one click to copy it as text
 - 🎚️ **Simple or Advanced:** Simple shows just the numbers. Advanced adds peaks, 2-minute averages and history.
 - 📌 **Pin:** keeps the window on top. Position, size and pin state are remembered.
 - 🌗 **Themes:** light and dark, following Windows
@@ -100,6 +101,22 @@ To keep the window calm:
 - 💾 **Disk** counts everything an app reads and writes, which can include network traffic, so it won't always match Task Manager
 - 🌐 **There is no Network column**, because there is no cheap way to measure it per app
 
+## 🧾 Specs
+
+<p align="center">
+  <img src="docs/images/specs.png" width="340" alt="The Specs tab: rows for CPU, GPU, motherboard, memory, two drives, display and Windows, with a Copy specs button at the top">
+</p>
+
+- 🖥️ **Every part:** CPU, GPU, motherboard, memory sticks and slots, each drive, each display and the Windows version. Laptops and prebuilt PCs show their model instead of a board code.
+- 📋 **Copy specs**, or Ctrl+C, puts it all on the clipboard as plain lines, ready for a chat or a forum post:
+  ```text
+  CPU: Intel Core i7-4790K (4 cores, 8 threads, 4.0 GHz)
+  GPU: NVIDIA GeForce RTX 2070 SUPER (8 GB)
+  Memory: 16 GB DDR3-2400 (2 × 8 GB)
+  ```
+- 🔍 **More detail with more room:** a large window adds each part's details, such as cache, CUDA cores, PCIe link and BIOS version
+- 🪶 **Read once,** the first time the tab opens, so it costs nothing until then
+
 ## 🛑 Ending an app
 
 Hover a row in the Busy list or the Apps view to reveal **End**, then confirm. Keep, Esc or clicking elsewhere cancels.
@@ -111,7 +128,7 @@ Hover a row in the Busy list or the Apps view to reveal **End**, then confirm. K
 
 ## 🌡️ CPU temperature
 
-Windows has no standard API for this, so Vitals reads what AMD provides:
+Windows has no standard API for this. On Intel CPUs it can only be read through a kernel driver, and Vitals installs nothing, so on Intel the CPU temperature and power tiles make way for other readings. On AMD, Vitals reads what AMD provides:
 
 - 🟡 **Without admin rights:** the tile shows the I/O die, labelled "CPU I/O die". This is not a core temperature.
 - 🟢 **Click that tile** for the true core temperature, labelled "CPU temp". This starts a small helper with admin rights. Windows normally shows a UAC prompt, but if prompts are turned off it happens silently, so the click is the only consent.
@@ -123,13 +140,15 @@ Windows has no standard API for this, so Vitals reads what AMD provides:
 - 👤 The main app never runs elevated
 - 📡 The helper only sends one reading per second down a one-way pipe, and exits as soon as the pipe closes
 - 📁 It loads AMD's DLL by full path from Program Files, which only administrators can write to
-- 🧱 The exe resolves its DLLs from System32 only, so a malicious DLL sitting in Downloads can't run inside it
+- 🧱 The exe resolves its DLLs from System32 only, so a malicious DLL sitting in Downloads can't run inside it. That includes AMD's `atiadlxx.dll` and NVIDIA's `nvml.dll`, which their drivers install there.
 
 ## 🖥️ Hardware
 
-- ✅ Built and tested on a Ryzen 7 9800X3D with a Radeon RX 7900 XTX
-- 🌐 Load, memory, disk and network work on any PC
-- 🔴 GPU sensors need an AMD GPU. On other hardware those tiles show a dash.
+- ✅ Built and tested on a Ryzen 7 9800X3D with a Radeon RX 7900 XTX, and on a Core i7-4790K with a GeForce RTX 2070 SUPER
+- 🌐 Load, memory, disk, network and Specs work on any PC. If Windows is missing its disk or network performance counters, Vitals reads the totals straight from Windows instead.
+- 🔴 **AMD GPUs** report everything, including hotspot and memory temperature
+- 🟢 **NVIDIA GPUs** report temperature, load, power, clock, fan speed and video memory, through the library that comes with the driver. GeForce cards don't report hotspot or memory temperature, and recent ones give fan speed as a percentage.
+- 🔁 **A reading a PC can't report at all** gives its tile to another one, such as GPU clock or disk activity, rather than showing a dash forever
 
 ## 🛠️ Building
 

@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vitals Specs Designs</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* Layout: a column of live, resizable window frames per direction, on the app's own warm greys. */
+  :root {
+    --page: #111110; --panel: #181817; --ink: #f0efec; --ink2: #c3c2b7; --ink3: #8f8e85; --line: #2c2c2a; --accent: #3987e5;
+    --font: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    --mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --page: #ecebe6; --panel: #f6f5f1; --ink: #0b0b0b; --ink2: #52514e; --ink3: #76756f; --line: #dcdbd5; --accent: #2a78d6;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --page: #ecebe6; --panel: #f6f5f1; --ink: #0b0b0b; --ink2: #52514e; --ink3: #76756f; --line: #dcdbd5; --accent: #2a78d6;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--page); }
+  body {
+    margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 var(--font);
+    padding-block: 24px 64px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  .wrap { max-width: 1320px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 8px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0; text-wrap: balance; }
+  .note { color: var(--ink2); margin: 0 0 24px; max-width: 76ch; }
+  button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
+  h2 { font-size: 16px; font-weight: 600; margin: 0 0 2px; }
+  section > p { color: var(--ink2); margin: 0 0 14px; max-width: 80ch; }
+  .frames { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  figure { margin: 0; max-width: 100%; min-width: 0; }
+  figcaption { color: var(--ink3); font-size: 12px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .frame { position: relative; resize: both; overflow: hidden; border-radius: 8px; max-width: 100%;
+           min-width: 120px; min-height: 36px; box-shadow: 0 0 0 1px var(--line), 0 8px 24px rgba(0,0,0,.28); }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .clip { overflow-x: auto; }
+  pre { margin: 0; font: 13px/1.55 var(--mono); color: var(--ink); white-space: pre; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Vitals: Specs tab, four directions</h1>
+    <button id="theme" type="button">Toggle light / dark</button>
+  </header>
+  <p class="note">A third tab beside Vitals and Apps that lays out this PC's parts, with one click to copy them as text. Every frame is live: drag a bottom-right corner to resize it, scroll with the wheel when it overflows, and click the copy control. All content is real, read from this PC (i7-4790K, RTX 2070 SUPER, Maximus VII Impact). Everything is drawn on canvas with primitives that map one-to-one to Direct2D: rounded rectangles, lines, circles and Segoe UI text without wrapping.</p>
+  <div id="root"></div>
+  <section>
+    <h2>What Copy puts on the clipboard</h2>
+    <p>The same text in every direction. Plain lines that paste cleanly into Discord, Reddit or a forum post.</p>
+    <div class="clip"><pre id="copied"></pre></div>
+  </section>
+</div>
+
+<script>
+'use strict';
+const params = new URLSearchParams(location.search);
+if (params.get('theme') === 'light' || params.get('theme') === 'dark') {
+  document.documentElement.dataset.theme = params.get('theme');
+}
+const FONT = '"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif';
+/* The app's own palettes, from src/ui.rs. */
+const THEMES = {
+  dark:  { surface:'#1a1a19', raised:'#232322', track:'#333330', ink:'#f0efec', ink2:'#c3c2b7', ink3:'#8f8e85', accent:'#3987e5', on:'#ffffff' },
+  light: { surface:'#fcfcfb', raised:'#f3f2ee', track:'#e4e3de', ink:'#0b0b0b', ink2:'#52514e', ink3:'#76756f', accent:'#2a78d6', on:'#ffffff' },
+};
+function themeName() {
+  const t = document.documentElement.dataset.theme;
+  if (t === 'light' || t === 'dark') return t;
+  return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+/* ---------- this PC, as Vitals would read it ---------- */
+const PC_NAME = 'GAMING-PC';
+const S = [
+  { key:'cpu', label:'CPU', items:[{ name:'Intel Core i7-4790K', line:'4 cores · 8 threads · 4.0 GHz' }],
+    facts:[['Cores','4 cores, 8 threads'], ['Base clock','4.0 GHz'], ['Cache','1 MB L2, 8 MB L3'], ['Socket','LGA 1150']] },
+  { key:'gpu', label:'GPU', items:[{ name:'NVIDIA GeForce RTX 2070 SUPER', line:'8 GB · 2560 CUDA cores' }],
+    facts:[['Video memory','8 GB, 256-bit'], ['CUDA cores','2560'], ['Max clock','2130 MHz'], ['Link','PCIe 3.0 x16, running x8'], ['Power limit','215 W'], ['Driver','551.86']] },
+  { key:'board', label:'Motherboard', items:[{ name:'ASUS MAXIMUS VII IMPACT', line:'BIOS 3003 · 28 Oct 2015' }],
+    facts:[['Maker','ASUSTeK Computer Inc.'], ['Revision','Rev 1.xx'], ['BIOS','3003, 28 Oct 2015']] },
+  { key:'ram', label:'Memory', items:[{ name:'16 GB DDR3-2400', line:'2 × 8 GB · 2 of 4 slots' }],
+    facts:[['Installed','2 × 8 GB'], ['Slots','2 of 4 used'], ['Speed','2400 MT/s'], ['Part','DDR3-2400 CL11 8GB']] },
+  { key:'storage', label:'Storage', items:[{ name:'Kingston SV300S37A240G', line:'240 GB SSD · SATA' }, { name:'WDC WD10EZEX-22BN5A0', line:'1 TB hard drive · SATA' }],
+    facts:[['SSD','Kingston SV300S37A240G, 240 GB'], ['Hard drive','WDC WD10EZEX-22BN5A0, 1 TB']] },
+  { key:'display', label:'Display', items:[{ name:'LG TV SSCR2', line:'3840 × 2160 · 120 Hz · 175%' }],
+    facts:[['Resolution','3840 × 2160'], ['Refresh rate','120 Hz'], ['Scale','175%']] },
+  { key:'os', label:'Windows', items:[{ name:'Windows 10 Pro 22H2', line:'Build 19045.6466' }],
+    facts:[['Edition','Pro'], ['Version','22H2'], ['Build','19045.6466']] },
+];
+const COPY_TEXT = [
+  'CPU: Intel Core i7-4790K (4 cores, 8 threads, 4.0 GHz)',
+  'GPU: NVIDIA GeForce RTX 2070 SUPER (8 GB)',
+  'Motherboard: ASUS MAXIMUS VII IMPACT',
+  'Memory: 16 GB DDR3-2400 (2 × 8 GB)',
+  'Storage: Kingston SV300S37A240G (240 GB SSD), WDC WD10EZEX-22BN5A0 (1 TB HDD)',
+  'Display: LG TV SSCR2 (3840 × 2160, 120 Hz)',
+  'OS: Windows 10 Pro 22H2 (build 19045.6466)',
+].join('\n');
+document.getElementById('copied').textContent = COPY_TEXT;
+
+/* ---------- drawing primitives: each maps directly to a Direct2D / DirectWrite call ---------- */
+function text(g, s, x, y, o = {}) {
+  g.font = `${o.w || 400} ${o.s || 12}px ${FONT}`;
+  g.fillStyle = o.c; g.textAlign = o.a || 'left'; g.textBaseline = 'alphabetic';
+  g.fillText(s, x, y);
+  return g.measureText(s).width;
+}
+/* Vertically centred by capital height, like Canvas::text_mid. */
+function mid(g, s, x, y, o = {}) { return text(g, s, x, y + (o.s || 12) * 0.35, o); }
+function width(g, s, size, w = 400) { g.font = `${w} ${size}px ${FONT}`; return g.measureText(s).width; }
+function fit(g, s, size, w, room) {
+  if (width(g, s, size, w) <= room) return s;
+  let k = s.length;
+  while (k > 0 && width(g, s.slice(0, k) + '…', size, w) > room) k--;
+  return k > 0 ? s.slice(0, k) + '…' : '';
+}
+function rr(g, x, y, w, h, r, c) { g.fillStyle = c; g.beginPath(); g.roundRect(x, y, w, h, r); g.fill(); }
+function box(g, x, y, w, h, c, lw = 1.1, r = 0) { g.strokeStyle = c; g.lineWidth = lw; g.beginPath(); g.roundRect(x, y, w, h, r); g.stroke(); }
+function line(g, x1, y1, x2, y2, c, lw = 1.2) { g.strokeStyle = c; g.lineWidth = lw; g.lineCap = 'round'; g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke(); }
+function dot(g, x, y, r, c) { g.fillStyle = c; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); }
+function ring(g, x, y, r, c, lw = 1.2) { g.strokeStyle = c; g.lineWidth = lw; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.stroke(); }
+function poly(g, pts, c, lw = 1.5) { g.strokeStyle = c; g.lineWidth = lw; g.lineCap = 'round'; g.lineJoin = 'round'; g.beginPath(); pts.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.stroke(); }
+function hairline(g, x, y, w, c) { g.fillStyle = c; g.fillRect(x, y, w, 1); }
+const inside = (r, x, y) => r && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+
+/* Two offset squares: the copy glyph. A tick replaces it once copied. */
+function copyGlyph(g, cx, cy, c) {
+  box(g, cx - 4.5, cy - 2.5, 7, 7, c, 1.1, 1.5);
+  poly(g, [[cx - 2, cy - 3.5], [cx - 2, cy - 5], [cx + 4.5, cy - 5], [cx + 4.5, cy + 1.5], [cx + 3, cy + 1.5]], c, 1.1);
+}
+function tick(g, cx, cy, c) { poly(g, [[cx - 4, cy], [cx - 1, cy + 3], [cx + 4, cy - 3.5]], c, 1.6); }
+
+/* ---------- the title bar, with a third tab ---------- */
+const TITLE_H = 28;
+function titleBar(g, W, T, extra) {
+  const narrow = W < 230;
+  const tabs = narrow ? [['Vitals', 40], ['Apps', 34], ['Specs', 38]] : [['Vitals', 46], ['Apps', 40], ['Specs', 44]];
+  let x = 4;
+  for (const [label, w] of tabs) {
+    mid(g, label, x + w / 2, TITLE_H / 2, { s: 12, w: 600, a: 'center', c: label === 'Specs' ? T.ink : T.ink3 });
+    x += w;
+  }
+  const size = narrow ? 24 : 28;
+  const order = narrow ? ['close', 'pin', 'menu'] : ['close', 'max', 'min', 'pin', 'menu'];
+  if (extra) order.push(extra);
+  const rects = {};
+  order.forEach((b, i) => {
+    const r = { x: W - size * (i + 1), y: 0, w: size, h: TITLE_H };
+    rects[b] = r;
+    const cx = r.x + size / 2, cy = TITLE_H / 2, s = 4.5, c = T.ink2;
+    if (b === 'close') { line(g, cx - s, cy - s, cx + s, cy + s, c); line(g, cx + s, cy - s, cx - s, cy + s, c); }
+    if (b === 'max') box(g, cx - s, cy - s, s * 2, s * 2, c);
+    if (b === 'min') line(g, cx - s, cy, cx + s, cy, c);
+    if (b === 'pin') { ring(g, cx, cy - 2, 2.8, c); line(g, cx, cy + 1, cx, cy + 6, c); }
+    if (b === 'menu') { box(g, cx - 5.5, cy - 4.5, 11, 9, c); box(g, cx - 3, cy - 1, 3.5, 3, c); }
+  });
+  return { tabsEnd: x, rects };
+}
+
+/* A thin mark showing where a scrolled view is, as on the Apps page. */
+function scrollMark(g, T, area, content, scroll) {
+  if (content <= area.h) return;
+  const h = Math.max(20, area.h * area.h / content);
+  const y = area.y + (area.h - h) * (scroll / (content - area.h));
+  rr(g, area.x + area.w + 2, y, 3, h, 1.5, T.track);
+}
+function clipTo(g, area) { g.save(); g.beginPath(); g.rect(area.x - 2, area.y, area.w + 10, area.h); g.clip(); }
+
+/* ---------- A. Sheet: one row per part, label column on the left ---------- */
+function A_sheet(g, W, H, T, st) {
+  titleBar(g, W, T);
+  const hits = {};
+  const BAND = 34, x0 = 8, inner = W - 16;
+  /* The band: the PC's name, and the copy button. */
+  const copied = st.copied;
+  const label = copied ? 'Copied' : 'Copy specs';
+  const bw = width(g, label, 12, 600) + 34, bh = 24;
+  const b = { x: W - 8 - bw, y: TITLE_H + 4, w: bw, h: bh };
+  hits.copy = b;
+  if (copied) rr(g, b.x, b.y, b.w, b.h, 5, T.accent);
+  else if (st.hover === 'copy') rr(g, b.x, b.y, b.w, b.h, 5, T.track);
+  else box(g, b.x + .5, b.y + .5, b.w - 1, b.h - 1, T.track, 1, 5);
+  const ink = copied ? T.on : T.ink;
+  (copied ? tick : copyGlyph)(g, b.x + 14, b.y + bh / 2, ink);
+  mid(g, label, b.x + 26, b.y + bh / 2, { s: 12, w: 600, c: ink });
+  const nameRoom = b.x - x0 - 10;
+  if (nameRoom > 60) mid(g, fit(g, PC_NAME, 12, 400, nameRoom), x0 + 2, b.y + bh / 2, { c: T.ink2 });
+
+  /* Rows: two columns once the window is wide, the last one spanning both if it would sit alone. */
+  const top = TITLE_H + BAND, view = { x: x0, y: top, w: inner, h: H - top - 8 };
+  const cols = W >= 820 ? 2 : 1, GAP = 6;
+  const colW = (inner - GAP * (cols - 1)) / cols;
+  const stacked = colW < 250;
+  const labelW = colW >= 420 ? 116 : 92;
+  const rowH = s => (stacked ? 22 : 8) + s.items.length * 38 + (stacked ? 0 : 2);
+  const cells = []; let y = 0;
+  for (let i = 0; i < S.length; i += cols) {
+    const group = S.slice(i, i + cols);
+    const h = Math.max(...group.map(rowH));
+    group.forEach((s, j) => {
+      const span = group.length === 1 && cols > 1;
+      cells.push({ s, x: x0 + j * (colW + GAP), y, w: span ? inner : colW, h });
+    });
+    y += h + GAP;
+  }
+  const content = y - GAP;
+  const scroll = Math.max(0, Math.min(st.scroll, content - view.h));
+  st.max = Math.max(0, content - view.h);
+  clipTo(g, view);
+  for (const c of cells) {
+    const cy = top + c.y - scroll;
+    rr(g, c.x, cy, c.w, c.h, 6, T.raised);
+    const tx = stacked ? c.x + 10 : c.x + 10 + labelW;
+    const room = c.x + c.w - 10 - tx;
+    let ny = cy + (stacked ? 34 : 20);
+    if (stacked) mid(g, c.s.label, c.x + 10, cy + 14, { s: 11, c: T.ink3 });
+    else mid(g, c.s.label, c.x + 10, cy + 20, { s: 12, c: T.ink3 });
+    for (const it of c.s.items) {
+      mid(g, fit(g, it.name, 13, 600, room), tx, ny, { s: 13, w: 600, c: T.ink });
+      mid(g, fit(g, it.line, 11, 400, room), tx, ny + 16, { s: 11, c: T.ink2 });
+      ny += 38;
+    }
+  }
+  g.restore();
+  scrollMark(g, T, { ...view, w: view.w - 2 }, content, scroll);
+  return hits;
+}
+
+/* ---------- B. Cards: tiles like the Vitals page, details as label/value pairs ---------- */
+function B_cards(g, W, H, T, st) {
+  const iconInBar = W >= 230;
+  const bar = titleBar(g, W, T, iconInBar ? 'copy' : null);
+  const hits = {};
+  const copied = st.copied;
+  if (iconInBar) {
+    const r = bar.rects.copy;
+    hits.copy = r;
+    if (st.hover === 'copy' && !copied) rr(g, r.x, r.y, r.w, r.h, 0, T.track);
+    (copied ? tick : copyGlyph)(g, r.x + r.w / 2, TITLE_H / 2, copied ? T.accent : T.ink2);
+    if (copied) {
+      const room = r.x - bar.tabsEnd - 8;
+      if (room > 50) mid(g, 'Copied', r.x - 4, TITLE_H / 2, { s: 12, w: 600, a: 'right', c: T.accent });
+    }
+  }
+  const x0 = 8, inner = W - 16, GAP = 6;
+  const cols = W < 500 ? 1 : W < 820 ? 2 : 3;
+  const cardW = (inner - GAP * (cols - 1)) / cols;
+  const cards = S.filter(s => s.key !== 'os');
+  const os = S.find(s => s.key === 'os');
+  const cardH = s => s.items.length > 1 ? 30 + s.items.length * 36 : 50 + s.facts.length * 19 + 4;
+  const placed = []; let y = 0;
+  for (let i = 0; i < cards.length; i += cols) {
+    const group = cards.slice(i, i + cols);
+    const h = Math.max(...group.map(cardH));
+    group.forEach((s, j) => placed.push({ s, x: x0 + j * (cardW + GAP), y, w: cardW, h }));
+    y += h + GAP;
+  }
+  const osY = y; y += 34 + GAP;
+  let btnY = null;
+  if (!iconInBar) { btnY = y; y += 30 + GAP; }
+  const content = y - GAP;
+  const view = { x: x0, y: TITLE_H, w: inner, h: H - TITLE_H - 8 };
+  const scroll = Math.max(0, Math.min(st.scroll, content - view.h));
+  st.max = Math.max(0, content - view.h);
+  clipTo(g, view);
+  for (const c of placed) {
+    const top = TITLE_H + c.y - scroll, L = c.x + 10, R = c.x + c.w - 10;
+    rr(g, c.x, top, c.w, c.h, 6, T.raised);
+    mid(g, c.s.label, L, top + 13, { s: 12, c: T.ink2 });
+    if (c.s.items.length > 1) {
+      let ny = top + 36;
+      for (const it of c.s.items) {
+        mid(g, fit(g, it.name, 13, 600, R - L), L, ny, { s: 13, w: 600, c: T.ink });
+        mid(g, fit(g, it.line, 11, 400, R - L), L, ny + 15, { s: 11, c: T.ink2 });
+        ny += 36;
+      }
+      continue;
+    }
+    mid(g, fit(g, c.s.items[0].name, 16, 600, R - L), L, top + 34, { s: 16, w: 600, c: T.ink });
+    let fy = top + 58;
+    for (const [k, v] of c.s.facts) {
+      const kw = mid(g, k, L, fy, { s: 12, c: T.ink3 });
+      mid(g, fit(g, v, 12, 400, R - L - kw - 12), R, fy, { s: 12, a: 'right', c: T.ink });
+      fy += 19;
+    }
+  }
+  const oy = TITLE_H + osY - scroll;
+  rr(g, x0, oy, inner, 34, 6, T.raised);
+  const ow = mid(g, os.items[0].name, x0 + 10, oy + 17, { s: 13, w: 600, c: T.ink });
+  const rest = inner - 20 - ow - 12;
+  if (rest > 40) mid(g, fit(g, os.items[0].line, 12, 400, rest), x0 + inner - 10, oy + 17, { s: 12, a: 'right', c: T.ink2 });
+  if (btnY !== null) {
+    const r = { x: x0, y: TITLE_H + btnY - scroll, w: inner, h: 30 };
+    hits.copy = r;
+    rr(g, r.x, r.y, r.w, r.h, 6, copied ? T.accent : st.hover === 'copy' ? T.track : T.raised);
+    const lbl = copied ? 'Copied' : 'Copy specs';
+    const tw = width(g, lbl, 12, 600) + 20;
+    (copied ? tick : copyGlyph)(g, r.x + r.w / 2 - tw / 2 + 6, r.y + 15, copied ? T.on : T.ink);
+    mid(g, lbl, r.x + r.w / 2 - tw / 2 + 20, r.y + 15, { s: 12, w: 600, c: copied ? T.on : T.ink });
+  }
+  g.restore();
+  scrollMark(g, T, { ...view, w: view.w - 2 }, content, scroll);
+  return hits;
+}
+
+/* ---------- C. Summary: CPU and GPU lead, everything else in a reference table ---------- */
+function C_summary(g, W, H, T, st) {
+  titleBar(g, W, T);
+  const hits = {};
+  const x0 = 8, inner = W - 16, copied = st.copied;
+  const side = inner >= 560;
+  const cpu = S[0].items[0].name, gpu = S[1].items[0].name;
+  const heroH = side ? 84 : 116;
+  const hy = TITLE_H;
+  rr(g, x0, hy, inner, heroH, 6, T.raised);
+  /* The button sits on the label row, so the names below get the full width. */
+  const lbl = copied ? 'Copied' : 'Copy';
+  const bw = width(g, lbl, 12, 600) + 32;
+  const b = { x: x0 + inner - 8 - bw, y: hy + 8, w: bw, h: 24 };
+  hits.copy = b;
+  rr(g, b.x, b.y, b.w, b.h, 5, st.hover === 'copy' && !copied ? T.accent + 'dd' : T.accent);
+  (copied ? tick : copyGlyph)(g, b.x + 13, b.y + 12, T.on);
+  mid(g, lbl, b.x + 24, b.y + 12, { s: 12, w: 600, c: T.on });
+  const L = x0 + 12, nameSize = inner < 260 ? 15 : 19;
+  if (side) {
+    const half = (inner - 24) / 2;
+    mid(g, 'CPU', L, hy + 20, { s: 11, c: T.ink3 });
+    mid(g, 'GPU', L + half + 12, hy + 20, { s: 11, c: T.ink3 });
+    mid(g, fit(g, cpu, nameSize, 600, half - 8), L, hy + 42, { s: nameSize, w: 600, c: T.ink });
+    mid(g, fit(g, gpu, nameSize, 600, half - 8), L + half + 12, hy + 42, { s: nameSize, w: 600, c: T.ink });
+  } else {
+    mid(g, 'CPU', L, hy + 20, { s: 11, c: T.ink3 });
+    mid(g, fit(g, cpu, nameSize, 600, inner - 24), L, hy + 40, { s: nameSize, w: 600, c: T.ink });
+    mid(g, 'GPU', L, hy + 62, { s: 11, c: T.ink3 });
+    mid(g, fit(g, gpu, nameSize, 600, inner - 24), L, hy + 82, { s: nameSize, w: 600, c: T.ink });
+  }
+  const summary = '16 GB DDR3-2400  ·  ASUS MAXIMUS VII IMPACT  ·  Windows 10 Pro 22H2';
+  mid(g, fit(g, summary, 12, 400, inner - 24), L, hy + heroH - 14, { s: 12, c: T.ink2 });
+
+  /* The table: groups flow into the shortest column. */
+  const top = hy + heroH + 10, view = { x: x0, y: top, w: inner, h: H - top - 8 };
+  const cols = inner >= 1000 ? 3 : inner >= 620 ? 2 : 1, GAP = 20;
+  const colW = (inner - GAP * (cols - 1)) / cols;
+  const keyW = Math.min(110, colW * 0.42);
+  const heights = new Array(cols).fill(0), groups = [];
+  for (const s of S) {
+    const h = 24 + s.facts.length * 22 + 10;
+    const c = heights.indexOf(Math.min(...heights));
+    groups.push({ s, x: x0 + c * (colW + GAP), y: heights[c] });
+    heights[c] += h;
+  }
+  const content = Math.max(...heights) - 10;
+  const scroll = Math.max(0, Math.min(st.scroll, content - view.h));
+  st.max = Math.max(0, content - view.h);
+  clipTo(g, view);
+  for (const gr of groups) {
+    let y = top + gr.y - scroll;
+    mid(g, gr.s.label, gr.x + 4, y + 10, { s: 12, w: 600, c: T.ink });
+    hairline(g, gr.x, y + 21, colW, T.track);
+    y += 24;
+    for (const [k, v] of gr.s.facts) {
+      mid(g, fit(g, k, 12, 400, keyW - 8), gr.x + 4, y + 11, { s: 12, c: T.ink2 });
+      mid(g, fit(g, v, 12, 400, colW - keyW - 8), gr.x + 4 + keyW, y + 11, { s: 12, c: T.ink });
+      y += 22;
+    }
+  }
+  g.restore();
+  scrollMark(g, T, { ...view, w: view.w - 2 }, content, scroll);
+  return hits;
+}
+
+/* ---------- D. Parts: a drawn glyph per part, and a copy bar along the bottom ---------- */
+function glyph(g, key, cx, cy, c) {
+  if (key === 'cpu') {
+    box(g, cx - 6, cy - 6, 12, 12, c, 1.2, 2); rr(g, cx - 2.5, cy - 2.5, 5, 5, 1, c);
+    for (const d of [-3, 0, 3]) { line(g, cx + d, cy - 9, cx + d, cy - 7, c, 1.1); line(g, cx + d, cy + 7, cx + d, cy + 9, c, 1.1); line(g, cx - 9, cy + d, cx - 7, cy + d, c, 1.1); line(g, cx + 7, cy + d, cx + 9, cy + d, c, 1.1); }
+  } else if (key === 'gpu') {
+    box(g, cx - 9, cy - 5.5, 18, 11, c, 1.2, 2); ring(g, cx - 2, cy, 3.2, c, 1.1); dot(g, cx - 2, cy, 1, c);
+    line(g, cx + 4, cy - 2, cx + 6, cy - 2, c, 1.1); line(g, cx + 4, cy + 1, cx + 6, cy + 1, c, 1.1); line(g, cx - 6, cy + 7.5, cx + 3, cy + 7.5, c, 1.4);
+  } else if (key === 'board') {
+    box(g, cx - 8, cy - 8, 16, 16, c, 1.2, 2); rr(g, cx - 5, cy - 5, 5, 5, 1, c);
+    line(g, cx + 2, cy - 4, cx + 5, cy - 4, c, 1.1); line(g, cx - 5, cy + 2.5, cx + 5, cy + 2.5, c, 1.1); line(g, cx - 5, cy + 5, cx + 5, cy + 5, c, 1.1);
+  } else if (key === 'ram') {
+    box(g, cx - 9, cy - 4.5, 18, 8, c, 1.2, 1.5);
+    for (const d of [-5.5, -1, 3.5]) rr(g, cx + d, cy - 2.5, 3, 4, .5, c);
+    for (let d = -7; d <= 7; d += 2.5) line(g, cx + d, cy + 5.5, cx + d, cy + 7, c, 1);
+  } else if (key === 'storage') {
+    box(g, cx - 7, cy - 8, 14, 16, c, 1.2, 2.5); ring(g, cx, cy - 1, 3.6, c, 1.1); dot(g, cx, cy - 1, 1, c); line(g, cx - 3, cy + 5, cx + 3, cy + 5, c, 1.1);
+  } else if (key === 'display') {
+    box(g, cx - 9, cy - 7, 18, 11.5, c, 1.2, 1.5); line(g, cx, cy + 4.5, cx, cy + 7.5, c, 1.2); line(g, cx - 4, cy + 8, cx + 4, cy + 8, c, 1.4);
+  } else if (key === 'os') {
+    box(g, cx - 8, cy - 7, 16, 14, c, 1.2, 2); line(g, cx - 8, cy - 3, cx + 8, cy - 3, c, 1.1); dot(g, cx - 5.5, cy - 5, .8, c); dot(g, cx - 3, cy - 5, .8, c);
+  }
+}
+function D_parts(g, W, H, T, st) {
+  titleBar(g, W, T);
+  const hits = {};
+  const x0 = 8, inner = W - 16, copied = st.copied;
+  const FOOT = 32;
+  const view = { x: x0, y: TITLE_H, w: inner, h: H - TITLE_H - FOOT - 14 };
+  const cols = inner >= 760 ? 2 : 1, GAP = 24;
+  const colW = (inner - GAP * (cols - 1)) / cols;
+  const icon = colW < 230 ? 26 : 32, ITEM = 42;
+  const showLabel = colW >= 300;
+  const per = Math.ceil(S.length / cols);
+  const colH = [];
+  const rows = [];
+  for (let c = 0; c < cols; c++) {
+    let y = 0;
+    for (const s of S.slice(c * per, (c + 1) * per)) { rows.push({ s, x: x0 + c * (colW + GAP), y }); y += s.items.length * ITEM + 1; }
+    colH.push(y);
+  }
+  const content = Math.max(...colH);
+  const scroll = Math.max(0, Math.min(st.scroll, content - view.h));
+  st.max = Math.max(0, content - view.h);
+  clipTo(g, view);
+  for (const r of rows) {
+    let y = TITLE_H + r.y - scroll;
+    const tx = r.x + icon + 10;
+    rr(g, r.x, y + (ITEM - icon) / 2, icon, icon, 6, T.raised);
+    glyph(g, r.s.key, r.x + icon / 2, y + ITEM / 2, T.accent);
+    r.s.items.forEach((it, i) => {
+      const iy = y + i * ITEM;
+      const lw = showLabel && i === 0 ? width(g, r.s.label, 11, 400) + 12 : 0;
+      if (lw) mid(g, r.s.label, r.x + colW, iy + 15, { s: 11, a: 'right', c: T.ink3 });
+      mid(g, fit(g, it.name, 13, 600, colW - icon - 10 - lw), tx, iy + 15, { s: 13, w: 600, c: T.ink });
+      mid(g, fit(g, it.line, 11, 400, colW - icon - 10), tx, iy + 30, { s: 11, c: T.ink2 });
+    });
+    hairline(g, tx, y + r.s.items.length * ITEM, colW - icon - 10, T.track);
+  }
+  g.restore();
+  scrollMark(g, T, { ...view, w: view.w - 2 }, content, scroll);
+  const b = { x: x0, y: H - 8 - FOOT, w: inner, h: FOOT };
+  hits.copy = b;
+  rr(g, b.x, b.y, b.w, b.h, 6, copied ? T.accent : st.hover === 'copy' ? T.track : T.raised);
+  const lbl = copied ? (inner >= 200 ? 'Copied to clipboard' : 'Copied') : 'Copy specs';
+  const tw = width(g, lbl, 12, 600) + 20;
+  (copied ? tick : copyGlyph)(g, b.x + b.w / 2 - tw / 2 + 6, b.y + FOOT / 2, copied ? T.on : T.ink);
+  mid(g, lbl, b.x + b.w / 2 - tw / 2 + 20, b.y + FOOT / 2, { s: 12, w: 600, c: copied ? T.on : T.ink });
+  return hits;
+}
+
+/* ---------- page assembly ---------- */
+const DESIGNS = [
+  { id: 'sheet', t: 'A. Sheet', p: 'One row per part with a label column, like a spec sheet. The copy button and the PC name share a band at the top. Two columns from 820 wide; labels move above the names when narrow. Scrolls with the wheel when it overflows.', f: A_sheet },
+  { id: 'cards', t: 'B. Cards', p: 'Each part is a card in the style of the Vitals tiles, with its details as label and value pairs. Windows is a slim bar at the end. Copy is an icon in the title bar beside the menu, becoming a full-width button below 230 wide where the title bar has no room.', f: B_cards },
+  { id: 'summary', t: 'C. Summary', p: 'The CPU and GPU lead in large type, with memory, board and Windows in one line beneath and a solid Copy button. Everything else is a dense reference table in up to three columns, like System Information.', f: C_summary },
+  { id: 'parts', t: 'D. Parts', p: 'A small drawn glyph for each part, the name and its key facts beside it, and a copy bar pinned along the bottom so it is always in reach. Two columns from 760 wide.', f: D_parts },
+];
+const SIZES = [['Medium', 340, 520], ['Narrow', 200, 520], ['Short', 340, 260], ['Large', 1240, 760]];
+const only = params.get('only');
+const root = document.getElementById('root');
+const frames = [];
+for (const d of DESIGNS) {
+  if (only && only !== d.id) continue;
+  const sec = document.createElement('section');
+  sec.innerHTML = `<h2>${d.t}</h2><p>${d.p}</p>`;
+  const row = document.createElement('div'); row.className = 'frames'; sec.append(row);
+  for (const [name, w, h] of SIZES) {
+    const fig = document.createElement('figure');
+    const fr = document.createElement('div'); fr.className = 'frame'; fr.style.width = w + 'px'; fr.style.height = h + 'px';
+    const cv = document.createElement('canvas'); fr.append(cv);
+    const cap = document.createElement('figcaption');
+    fig.append(fr, cap); row.append(fig);
+    const o = { cv, fr, cap, name, d, st: { copied: false, hover: null, scroll: 0, max: 0 }, hits: {} };
+    frames.push(o);
+    new ResizeObserver(() => paint(o)).observe(fr);
+    const at = e => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    cv.addEventListener('mousemove', e => {
+      const [x, y] = at(e); const h = inside(o.hits.copy, x, y) ? 'copy' : null;
+      cv.style.cursor = h ? 'pointer' : 'default';
+      if (h !== o.st.hover) { o.st.hover = h; paint(o); }
+    });
+    cv.addEventListener('mouseleave', () => { o.st.hover = null; paint(o); });
+    cv.addEventListener('click', e => {
+      const [x, y] = at(e);
+      if (!inside(o.hits.copy, x, y)) return;
+      try { navigator.clipboard.writeText(COPY_TEXT).catch(() => {}); } catch (_) { /* the frame still shows the copied state */ }
+      o.st.copied = true; paint(o);
+      clearTimeout(o.timer); o.timer = setTimeout(() => { o.st.copied = false; paint(o); }, 2000);
+    });
+    cv.addEventListener('wheel', e => {
+      if (o.st.max <= 0) return;
+      e.preventDefault();
+      o.st.scroll = Math.max(0, Math.min(o.st.max, o.st.scroll + e.deltaY * 0.5));
+      paint(o);
+    }, { passive: false });
+  }
+  root.append(sec);
+}
+function paint(o) {
+  const w = o.fr.clientWidth, h = o.fr.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (!w || !h) return;
+  const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (o.cv.width !== bw || o.cv.height !== bh) { o.cv.width = bw; o.cv.height = bh; }
+  const g = o.cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const T = THEMES[themeName()];
+  g.fillStyle = T.surface; g.fillRect(0, 0, w, h);
+  o.hits = o.d.f(g, w, h, T, o.st) || {};
+  o.cap.textContent = `${o.name} · ${w} × ${h}`;
+}
+const repaint = () => frames.forEach(paint);
+document.getElementById('theme').addEventListener('click', () => {
+  document.documentElement.dataset.theme = themeName() === 'dark' ? 'light' : 'dark';
+  repaint();
+});
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', repaint);
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(repaint);
+</script>
+</body>
+</html>

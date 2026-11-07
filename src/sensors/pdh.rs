@@ -30,15 +30,17 @@ pub struct Activity {
     pub upload_mb: Option<f32>,
 }
 
+/// Each counter is optional. A damaged counter registry can lose whole counter
+/// sets, such as disk or network, and that must not cost the CPU readings too.
 pub struct Counters {
     query: PDH_HQUERY,
-    cpu_load: PDH_HCOUNTER,
-    cpu_performance: PDH_HCOUNTER,
-    threads: PDH_HCOUNTER,
-    disk_read: PDH_HCOUNTER,
-    disk_write: PDH_HCOUNTER,
-    download: PDH_HCOUNTER,
-    upload: PDH_HCOUNTER,
+    cpu_load: Option<PDH_HCOUNTER>,
+    cpu_performance: Option<PDH_HCOUNTER>,
+    threads: Option<PDH_HCOUNTER>,
+    disk_read: Option<PDH_HCOUNTER>,
+    disk_write: Option<PDH_HCOUNTER>,
+    download: Option<PDH_HCOUNTER>,
+    upload: Option<PDH_HCOUNTER>,
 }
 
 // SAFETY: the query handle is owned by the sampler thread and never shared.
@@ -58,28 +60,29 @@ impl Counters {
                 let status = PdhAddEnglishCounterW(query, path, 0, &mut counter);
                 (status == ERROR_SUCCESS.0).then_some(counter)
             };
-            let counters = (|| {
-                Some(Self {
-                    query,
-                    cpu_load: add(w!(r"\Processor Information(_Total)\% Processor Utility"))?,
-                    cpu_performance: add(w!(
-                        r"\Processor Information(_Total)\% Processor Performance"
-                    ))?,
-                    threads: add(w!(r"\Processor Information(*)\% Processor Utility"))?,
-                    disk_read: add(w!(r"\PhysicalDisk(_Total)\Disk Read Bytes/sec"))?,
-                    disk_write: add(w!(r"\PhysicalDisk(_Total)\Disk Write Bytes/sec"))?,
-                    download: add(w!(r"\Network Interface(*)\Bytes Received/sec"))?,
-                    upload: add(w!(r"\Network Interface(*)\Bytes Sent/sec"))?,
-                })
-            })();
-            if counters.is_none() {
-                PdhCloseQuery(query);
-                return None;
-            }
+            let counters = Self {
+                query,
+                cpu_load: add(w!(r"\Processor Information(_Total)\% Processor Utility")),
+                cpu_performance: add(w!(
+                    r"\Processor Information(_Total)\% Processor Performance"
+                )),
+                threads: add(w!(r"\Processor Information(*)\% Processor Utility")),
+                disk_read: add(w!(r"\PhysicalDisk(_Total)\Disk Read Bytes/sec")),
+                disk_write: add(w!(r"\PhysicalDisk(_Total)\Disk Write Bytes/sec")),
+                download: add(w!(r"\Network Interface(*)\Bytes Received/sec")),
+                upload: add(w!(r"\Network Interface(*)\Bytes Sent/sec")),
+            };
             // Rate counters need two samples, so take the first one now.
             PdhCollectQueryData(query);
-            counters
+            Some(counters)
         }
+    }
+
+    /// Whether disk and network both have counters, so no other source is needed.
+    pub fn has_io(&self) -> bool {
+        [self.disk_read, self.disk_write, self.download, self.upload]
+            .iter()
+            .all(Option::is_some)
     }
 
     pub fn sample(&self) -> Activity {
@@ -89,13 +92,13 @@ impl Counters {
         }
         let megabytes = |v: f32| v / BYTES_PER_MB;
         Activity {
-            cpu_load: value(self.cpu_load).map(|v| v.clamp(0.0, 100.0)),
-            cpu_performance: value(self.cpu_performance),
-            threads: thread_loads(self.threads),
-            disk_read_mb: value(self.disk_read).map(megabytes),
-            disk_write_mb: value(self.disk_write).map(megabytes),
-            download_mb: total(self.download).map(megabytes),
-            upload_mb: total(self.upload).map(megabytes),
+            cpu_load: self.cpu_load.and_then(value).map(|v| v.clamp(0.0, 100.0)),
+            cpu_performance: self.cpu_performance.and_then(value),
+            threads: self.threads.map(thread_loads).unwrap_or_default(),
+            disk_read_mb: self.disk_read.and_then(value).map(megabytes),
+            disk_write_mb: self.disk_write.and_then(value).map(megabytes),
+            download_mb: self.download.and_then(total).map(megabytes),
+            upload_mb: self.upload.and_then(total).map(megabytes),
         }
     }
 }

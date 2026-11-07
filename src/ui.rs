@@ -11,12 +11,14 @@ use crate::apps::{AppRow, BusyApp, Icon, Sort, SortKey};
 use crate::gfx::{Align, Canvas, Color, Weight};
 use crate::history::{CAPACITY, Series};
 use crate::layout::{
-    Button, Cell, Layout, Mode, PAD, Page, Rect, StripItem, StripPlan, TABLE_ROW_PAD, TITLE_H,
-    Table, confirm_buttons, end_button, plan_strip,
+    Button, Cell, Layout, Mode, PAD, Page, Rect, SPECS_FACT_H, SPECS_ITEM_H, SPECS_LABEL_W,
+    SpecsPage, StripItem, StripPlan, TABLE_ROW_PAD, TITLE_H, Table, confirm_buttons, end_button,
+    plan_strip,
 };
 use crate::menu::{Action, Plan};
 use crate::metrics::{CoreStatus, MetricId, Monitor, Scale, Unit};
 use crate::severity::Severity;
+use crate::specs::{Part, Specs};
 
 const WARM: Color = Color::rgb(0xfab219);
 const HOT: Color = Color::rgb(0xec835a);
@@ -76,6 +78,8 @@ pub struct Hover {
     /// The line of the Apps table under the pointer, counted from its first line.
     pub row: Option<usize>,
     pub heading: Option<SortKey>,
+    /// The Specs page's copy button.
+    pub copy: bool,
 }
 
 pub struct View<'a> {
@@ -91,9 +95,15 @@ pub struct View<'a> {
     /// Show only the numbers, rather than the full detail on each tile.
     pub simple: bool,
     pub sort: Sort,
-    /// How many lines of the Apps table are scrolled off the top.
+    /// How many lines of the Apps table, or parts on the Specs page, are
+    /// scrolled off the top.
     pub scroll: usize,
     pub menu_open: bool,
+    /// What is in this PC, once it has been read.
+    pub specs: Option<&'a Specs>,
+    /// Whether the last copy worked, while the button is saying so.
+    pub copied: Option<bool>,
+    pub pc_name: Option<&'a str>,
 }
 
 /// The colors for one tile at a given severity.
@@ -172,6 +182,10 @@ pub fn paint(c: &Canvas, v: &View) {
     paint_title_bar(c, v);
     if let Some(table) = &v.layout.table {
         paint_table(c, v, table);
+        return;
+    }
+    if let Some(page) = &v.layout.specs {
+        paint_specs(c, v, page);
         return;
     }
     for cell in &v.layout.cells {
@@ -422,6 +436,7 @@ fn paint_tabs(c: &Canvas, v: &View) {
         let label = match page {
             Page::Vitals => "Vitals",
             Page::Apps => "Apps",
+            Page::Specs => "Specs",
         };
         let ink = if page == v.layout.page {
             v.theme.ink
@@ -1075,6 +1090,12 @@ fn strip_entry(item: StripItem, monitor: &Monitor) -> (&'static str, String, Sev
         (text, reading.severity)
     };
     match item {
+        // Without a temperature, the CPU's load is the next most telling number.
+        StripItem::Cpu if monitor.absent.contains(MetricId::CpuTemp) => (
+            "CPU",
+            percent(MetricId::CpuLoad, Some(100.0)),
+            Severity::Normal,
+        ),
         StripItem::Cpu => {
             let metric = monitor.cpu_temp_metric();
             let label = if metric == MetricId::CpuTemp {
@@ -1115,7 +1136,10 @@ fn paint_summary(c: &Canvas, v: &View, area: Rect) {
     const ITEM_GAP: f32 = 12.0;
     let y = area.y + area.h / 2.0;
     let mut x = area.x + TABLE_ROW_PAD;
-    for item in [Cpu, Gpu, Hotspot, Ram, Vram] {
+    let items = [Cpu, Gpu, Hotspot, Ram, Vram]
+        .into_iter()
+        .filter(|i| *i != Hotspot || !v.monitor.absent.contains(MetricId::GpuHotspot));
+    for item in items {
         let (label, value, severity) = strip_entry(item, v.monitor);
         let dot = if severity == Severity::Normal {
             0.0
@@ -1334,6 +1358,184 @@ fn paint_table_row(c: &Canvas, v: &View, table: &Table, row: &AppRow, index: usi
     }
 }
 
+/// Two overlapping squares, the usual sign for copy. The front one is filled
+/// with the button's own color so it hides the back one where they cross.
+fn copy_glyph(c: &Canvas, (x, y): (f32, f32), fill: Color, ink: Color) {
+    c.outline_rect(Rect::new(x - 2.0, y - 5.5, 7.5, 7.5), 1.1, ink);
+    c.fill_round(Rect::new(x - 6.0, y - 2.5, 8.5, 8.5), 0.0, fill);
+    c.outline_rect(Rect::new(x - 5.5, y - 2.0, 7.5, 7.5), 1.1, ink);
+}
+
+fn tick(c: &Canvas, (x, y): (f32, f32), ink: Color) {
+    c.polyline(
+        &[(x - 4.0, y), (x - 1.0, y + 3.0), (x + 4.0, y - 3.5)],
+        1.6,
+        ink,
+    );
+}
+
+/// The copy button keeps one size, and says what happened for a moment after.
+fn paint_copy_button(c: &Canvas, v: &View, r: Rect) {
+    const GLYPH: f32 = 12.0;
+    const GAP: f32 = 7.0;
+    let (fill, ink, glyph_ink, label) = match v.copied {
+        Some(true) => (v.theme.accent, WHITE, WHITE, "Copied"),
+        Some(false) => (v.theme.raised, v.theme.ink, v.theme.ink2, "Couldn't copy"),
+        None if v.hover.copy => (v.theme.track, v.theme.ink, v.theme.ink2, "Copy specs"),
+        None => (v.theme.raised, v.theme.ink, v.theme.ink2, "Copy specs"),
+    };
+    c.fill_round(r, 5.0, fill);
+    let width = GLYPH + GAP + c.measure(label, 12.0, Weight::Semibold);
+    let x = r.x + (r.w - width) / 2.0;
+    let y = r.y + r.h / 2.0;
+    if v.copied == Some(true) {
+        tick(c, (x + GLYPH / 2.0, y), glyph_ink);
+    } else {
+        copy_glyph(c, (x + GLYPH / 2.0, y), fill, glyph_ink);
+    }
+    c.text_mid(
+        label,
+        (x + GLYPH + GAP, y),
+        12.0,
+        Weight::Semibold,
+        Align::Left,
+        ink,
+    );
+}
+
+fn paint_specs(c: &Canvas, v: &View, page: &SpecsPage) {
+    paint_copy_button(c, v, page.copy);
+    // The PC's name is shown whole or not at all, since a cut name is no name.
+    let band_y = page.band.y + page.band.h / 2.0;
+    if let Some(name) = v.pc_name {
+        let room = page.copy.x - page.band.x - 12.0;
+        if c.measure(name, 12.0, Weight::Regular) <= room {
+            c.text_mid(
+                name,
+                (page.band.x + 2.0, band_y),
+                12.0,
+                Weight::Regular,
+                Align::Left,
+                v.theme.ink3,
+            );
+        }
+    }
+    let Some(specs) = v.specs else {
+        c.text_mid(
+            "Reading this PC's parts",
+            (page.view.x + page.view.w / 2.0, page.view.y + 20.0),
+            12.0,
+            Weight::Regular,
+            Align::Center,
+            v.theme.ink3,
+        );
+        return;
+    };
+    for (index, r) in page.visible(v.scroll) {
+        if let Some(part) = specs.parts.get(index) {
+            paint_part(c, v, page, part, r);
+        }
+    }
+
+    // A thin mark shows where the view is, as on the Apps page.
+    let hidden = page.max_scroll();
+    if hidden > 0 {
+        let body = page.view;
+        let share = 1.0 - hidden as f32 / page.longest().max(1) as f32;
+        let height = (body.h * share).max(20.0);
+        let top = body.y + (body.h - height) * (v.scroll as f32 / hidden as f32);
+        c.fill_round(
+            Rect::new(body.right() + 2.0, top, 3.0, height),
+            1.5,
+            v.theme.track,
+        );
+    }
+}
+
+fn paint_part(c: &Canvas, v: &View, page: &SpecsPage, part: &Part, r: Rect) {
+    const KEY_W: f32 = 110.0;
+    let theme = v.theme;
+    c.fill_round(r, TILE_RADIUS, theme.raised);
+    let left = r.x + INSET;
+    let label = part.kind.label();
+    let (x, first) = if page.stacked {
+        c.text_mid(
+            label,
+            (left, r.y + 14.0),
+            11.0,
+            Weight::Regular,
+            Align::Left,
+            theme.ink3,
+        );
+        (left, r.y + 34.0)
+    } else {
+        c.text_mid(
+            label,
+            (left, r.y + 20.0),
+            12.0,
+            Weight::Regular,
+            Align::Left,
+            theme.ink3,
+        );
+        (left + SPECS_LABEL_W, r.y + 20.0)
+    };
+    let room = r.right() - INSET - x;
+    let name = |text: &str, y: f32| {
+        let text = c.fit(text, 13.0, Weight::Semibold, room);
+        c.text_mid(
+            &text,
+            (x, y),
+            13.0,
+            Weight::Semibold,
+            Align::Left,
+            theme.ink,
+        );
+    };
+
+    if page.detailed && part.items.len() == 1 && !part.facts.is_empty() {
+        name(&part.items[0].name, first);
+        let mut y = first + 26.0;
+        for (key, value) in &part.facts {
+            if y + 8.0 > r.bottom() {
+                break;
+            }
+            let key = c.fit(key, 12.0, Weight::Regular, KEY_W - 8.0);
+            c.text_mid(&key, (x, y), 12.0, Weight::Regular, Align::Left, theme.ink3);
+            let value = c.fit(value, 12.0, Weight::Regular, room - KEY_W);
+            c.text_mid(
+                &value,
+                (x + KEY_W, y),
+                12.0,
+                Weight::Regular,
+                Align::Left,
+                theme.ink,
+            );
+            y += SPECS_FACT_H;
+        }
+        return;
+    }
+    let mut y = first;
+    for item in &part.items {
+        // A part cut short by a short window shows only whole devices.
+        if y + 22.0 > r.bottom() {
+            break;
+        }
+        name(&item.name, y);
+        if !item.line.is_empty() {
+            let line = c.fit(&item.line, 11.0, Weight::Regular, room);
+            c.text_mid(
+                &line,
+                (x, y + 16.0),
+                11.0,
+                Weight::Regular,
+                Align::Left,
+                theme.ink2,
+            );
+        }
+        y += SPECS_ITEM_H;
+    }
+}
+
 /// Paints the menu beside the pin, which is a small window of its own.
 pub fn paint_menu(c: &Canvas, theme: &Theme, plan: &Plan, hover: Option<usize>) {
     c.clear(theme.raised);
@@ -1443,13 +1645,18 @@ fn strip_item_width(c: &Canvas, item: StripItem, monitor: &Monitor, size: f32) -
 }
 
 fn plan(c: &Canvas, v: &View) -> StripPlan {
-    plan_strip(v.layout.width, v.layout.height, |items, size| {
-        let widths: f32 = items
-            .iter()
-            .map(|i| strip_item_width(c, *i, v.monitor, size))
-            .sum();
-        widths + strip_gap(size) * items.len().saturating_sub(1) as f32
-    })
+    plan_strip(
+        v.layout.width,
+        v.layout.height,
+        v.monitor.absent,
+        |items, size| {
+            let widths: f32 = items
+                .iter()
+                .map(|i| strip_item_width(c, *i, v.monitor, size))
+                .sum();
+            widths + strip_gap(size) * items.len().saturating_sub(1) as f32
+        },
+    )
 }
 
 fn paint_strip(c: &Canvas, v: &View) {

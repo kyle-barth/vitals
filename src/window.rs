@@ -28,20 +28,23 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE,
+    GetKeyState, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
 use crate::apps::{self, ProcessId, Sort, SortKey};
+use crate::clipboard;
 use crate::gfx::Gfx;
 use crate::helper::CoreLink;
-use crate::layout::{self, Button, Layout, Mode, Options, Page, Preset, TITLE_H};
+use crate::layout::{self, Button, Layout, Mode, Options, Page, PartShape, Preset, TITLE_H};
 use crate::menu::{self, Action, MenuState, WM_APP_MENU};
 use crate::metrics::{CoreStatus, MetricId, Monitor};
 use crate::sensors::processes::{EndOutcome, end_app};
+use crate::sensors::system::{CpuVendor, cpu_vendor};
 use crate::sensors::{Latest, Sampler};
 use crate::settings::Settings;
+use crate::specs::{PartKind, Specs};
 use crate::ui::{self, DARK, Hover, LIGHT, View};
 
 const CLASS_NAME: PCWSTR = w!("Vitals.Window");
@@ -49,6 +52,14 @@ const INSTANCE_MUTEX: PCWSTR = w!("Local\\Vitals.SingleInstance");
 const APP_TITLE: &str = "Vitals";
 const WM_APP_SAMPLE: u32 = WM_APP + 1;
 const WM_APP_ENDED: u32 = WM_APP + 2;
+/// The Specs page's facts have been read.
+const WM_APP_SPECS: u32 = WM_APP + 4;
+/// A copy has been tried. `wparam` is 1 if it worked.
+const WM_APP_COPIED: u32 = WM_APP + 5;
+const COPIED_TIMER: usize = 1;
+/// How long the copy button says what happened.
+const COPIED_SHOWS_MS: u32 = 2000;
+const KEY_C: usize = 0x43;
 /// Samples before an unanswered End question goes away by itself.
 const CONFIRM_SAMPLES: u32 = 10;
 /// Samples that a message stays on an app's row.
@@ -91,6 +102,9 @@ enum Deferred {
         dark: bool,
         topmost: bool,
     },
+    /// Emptying the clipboard sends a message to its last owner, which may be
+    /// this window.
+    Copy(String),
 }
 
 impl Deferred {
@@ -151,6 +165,15 @@ impl Deferred {
                         menu::tell_owner(hwnd, Action::Closed);
                     }
                 }
+                Deferred::Copy(text) => {
+                    let copied = clipboard::set_text(hwnd, &text);
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_APP_COPIED,
+                        WPARAM(usize::from(copied)),
+                        LPARAM(0),
+                    );
+                }
                 Deferred::TitleBarTheme { dark } => {
                     let value = i32::from(dark);
                     let _ = DwmSetWindowAttribute(
@@ -205,6 +228,31 @@ struct App {
     pointer: (f32, f32),
     menu_open: bool,
     menu_closed: Option<Instant>,
+    /// What is in this PC, once read. It is read the first time Specs opens.
+    specs: Option<Specs>,
+    specs_reading: bool,
+    /// Where the reading thread leaves its result.
+    specs_read: Arc<Mutex<Option<Specs>>>,
+    /// Whether the last copy worked, while the button is saying so.
+    copied: Option<bool>,
+    pc_name: Option<String>,
+}
+
+/// Where each part sits when the Specs page has two columns: the GPU side of
+/// the PC on the right, everything else on the left.
+fn shapes(specs: &Specs) -> Vec<PartShape> {
+    specs
+        .parts
+        .iter()
+        .map(|part| PartShape {
+            items: part.items.len(),
+            facts: part.facts.len(),
+            right: matches!(
+                part.kind,
+                PartKind::Gpu | PartKind::Display | PartKind::Windows
+            ),
+        })
+        .collect()
 }
 
 impl App {
@@ -221,6 +269,8 @@ impl App {
             page: self.settings.page,
             simple: self.settings.simple,
             sort: self.settings.sort.key,
+            absent: self.monitor.absent,
+            parts: self.specs.as_ref().map(shapes).unwrap_or_default(),
         }
     }
 
@@ -232,7 +282,64 @@ impl App {
             self.options(),
         );
         self.sync_table();
+        if self.layout.specs.is_some() {
+            self.read_specs();
+        }
         self.clamp_scroll();
+    }
+
+    /// Reads what is in this PC on a thread of its own, once. It takes a
+    /// moment, and most people never open the page, so it waits until then.
+    fn read_specs(&mut self) {
+        if self.specs.is_some() || self.specs_reading {
+            return;
+        }
+        self.specs_reading = true;
+        let (slot, target) = (self.specs_read.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            let specs = crate::specs::build(&crate::sensors::hardware::read());
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(specs);
+            }
+            // SAFETY: posting to a window that has gone simply fails.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_SPECS,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        });
+    }
+
+    fn on_specs(&mut self) {
+        if let Some(specs) = self.specs_read.lock().ok().and_then(|mut slot| slot.take()) {
+            self.specs = Some(specs);
+            self.specs_reading = false;
+            self.refresh_layout();
+            self.invalidate();
+        }
+    }
+
+    fn copy_specs(&mut self) {
+        if let Some(specs) = &self.specs {
+            self.pending.push(Deferred::Copy(specs.copy_text()));
+        }
+    }
+
+    fn on_copied(&mut self, worked: bool) {
+        self.copied = Some(worked);
+        // SAFETY: the handle is valid, and a timer only posts WM_TIMER later.
+        unsafe { SetTimer(Some(self.hwnd), COPIED_TIMER, COPIED_SHOWS_MS, None) };
+        self.invalidate();
+    }
+
+    fn on_copied_timer(&mut self) {
+        // SAFETY: the handle is valid, and the timer was set by `on_copied`.
+        let _ = unsafe { KillTimer(Some(self.hwnd), COPIED_TIMER) };
+        self.copied = None;
+        self.invalidate();
     }
 
     /// Starts or stops the extra work of the Apps page to match what is showing.
@@ -250,8 +357,13 @@ impl App {
     }
 
     fn clamp_scroll(&mut self) {
-        let visible = self.layout.table.as_ref().map_or(0, |t| t.visible);
-        let last = self.monitor.table.len().saturating_sub(visible);
+        let last = match &self.layout.specs {
+            Some(page) => page.max_scroll(),
+            None => {
+                let visible = self.layout.table.as_ref().map_or(0, |t| t.visible);
+                self.monitor.table.len().saturating_sub(visible)
+            }
+        };
         self.scroll = self.scroll.min(last);
     }
 
@@ -289,8 +401,14 @@ impl App {
             .then(|| self.monitor.table.iter().map(|r| r.key.clone()).collect())
     }
 
-    fn scroll_table(&mut self, delta: i16) {
-        let lines = (delta as f32 / WHEEL_NOTCH * WHEEL_LINES).round() as isize;
+    /// Scrolls the Apps table by lines, or the Specs page by whole parts.
+    fn scroll_by(&mut self, delta: i16) {
+        let per_notch = if self.layout.specs.is_some() {
+            1.0
+        } else {
+            WHEEL_LINES
+        };
+        let lines = (delta as f32 / WHEEL_NOTCH * per_notch).round() as isize;
         self.scroll = self.scroll.saturating_add_signed(-lines);
         self.clamp_scroll();
         let (x, y) = self.pointer;
@@ -334,6 +452,9 @@ impl App {
             sort: self.settings.sort,
             scroll: self.scroll,
             menu_open: self.menu_open,
+            specs: self.specs.as_ref(),
+            copied: self.copied,
+            pc_name: self.pc_name.as_deref(),
         };
         let _ = self.gfx.draw(|canvas| ui::paint(canvas, &view));
     }
@@ -342,7 +463,7 @@ impl App {
     fn on_sample(&mut self) {
         let snapshot = self.latest.lock().ok().and_then(|mut slot| slot.take());
         let Some(snapshot) = snapshot else { return };
-        let before = self.app_counts();
+        let before = (self.app_counts(), self.monitor.absent);
         let held = self.held_order();
         self.monitor.update(snapshot);
         if !self.monitor.table.is_empty() {
@@ -350,7 +471,7 @@ impl App {
             self.monitor.table = apps::arrange(rows, self.settings.sort, held.as_deref());
             self.clamp_scroll();
         }
-        if self.app_counts() != before {
+        if (self.app_counts(), self.monitor.absent) != before {
             self.refresh_layout();
         }
         self.age_app_messages();
@@ -634,6 +755,11 @@ impl App {
                 .and_then(|t| t.row_at(x, y))
                 .map(|slot| slot + self.scroll),
             heading: table.and_then(|t| t.header_at(x, y)),
+            copy: self
+                .layout
+                .specs
+                .as_ref()
+                .is_some_and(|page| page.copy.contains(x, y)),
         }
     }
 
@@ -799,6 +925,12 @@ impl App {
             self.set_page(page);
             return;
         }
+        if let Some(page) = &self.layout.specs {
+            if page.copy.contains(x, y) {
+                self.copy_specs();
+            }
+            return;
+        }
         if self.layout.table.is_some() {
             self.click_table(x, y);
             return;
@@ -842,6 +974,11 @@ impl App {
             .push(Deferred::TitleBarTheme { dark: self.dark });
         self.invalidate();
     }
+}
+
+fn control_held() -> bool {
+    // SAFETY: this only reads the calling thread's keyboard state.
+    unsafe { GetKeyState(i32::from(VK_CONTROL.0)) < 0 }
 }
 
 fn signed_low(value: LPARAM) -> i32 {
@@ -911,6 +1048,12 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
     match message {
         WM_APP_SAMPLE => app.on_sample(),
         WM_APP_ENDED => app.on_ended(),
+        WM_APP_SPECS => app.on_specs(),
+        WM_APP_COPIED => app.on_copied(wparam.0 != 0),
+        WM_TIMER if wparam.0 == COPIED_TIMER => app.on_copied_timer(),
+        WM_KEYDOWN if wparam.0 == KEY_C && app.layout.specs.is_some() && control_held() => {
+            app.copy_specs();
+        }
         WM_APP_MENU => {
             if let Some(action) = Action::from_code(wparam.0) {
                 app.on_menu(action);
@@ -989,7 +1132,7 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
         }
         WM_MOUSELEAVE | WM_NCMOUSELEAVE => app.pointer_left(),
         WM_MOUSEWHEEL => {
-            app.scroll_table(((wparam.0 >> 16) & 0xffff) as i16);
+            app.scroll_by(((wparam.0 >> 16) & 0xffff) as i16);
             return Some(LRESULT(0));
         }
         WM_LBUTTONUP => {
@@ -1168,6 +1311,11 @@ pub fn run() -> Result<()> {
             pointer: (0.0, 0.0),
             menu_open: false,
             menu_closed: None,
+            specs: None,
+            specs_reading: false,
+            specs_read: Arc::default(),
+            copied: None,
+            pc_name: std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();
@@ -1203,7 +1351,8 @@ pub fn run() -> Result<()> {
 
         let maximized = (*app).settings.maximized;
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
-        if (*app).settings.core_temp {
+        // The helper reads AMD's library, so there is nothing for it to do on Intel.
+        if (*app).settings.core_temp && cpu_vendor() != CpuVendor::Intel {
             core.start(hwnd.0 as isize);
         }
 

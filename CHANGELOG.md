@@ -5,6 +5,33 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+### Added
+
+- A Specs tab that lists the CPU, GPU, motherboard, memory, storage, displays
+  and Windows version. Copy specs, or Ctrl+C, puts them on the clipboard as
+  plain lines ready to paste into a chat or a forum post. Laptops and prebuilt
+  PCs show their model instead of a board code.
+- NVIDIA GPU support: temperature, load, power, clock, fan speed and video
+  memory, read through the library that comes with the NVIDIA driver.
+
+### Changed
+
+- A reading this PC can't report at all no longer leaves a tile that only ever
+  shows a dash. Another reading takes its place: GPU clock where an NVIDIA card
+  has no hotspot sensor, for example, or CPU clock where an Intel CPU's
+  temperature can't be read. The strip and the Apps summary leave the hotspot
+  out on such GPUs, and show CPU load in place of CPU temperature on Intel.
+- The title bar uses slightly smaller buttons below 280 wide, so that all
+  three tabs fit.
+
+### Fixed
+
+- CPU load, CPU clock, disk and network no longer all go blank on PCs where
+  Windows is missing some of its performance counters. Disk and network are
+  then read straight from Windows instead.
+- The core temperature prompt is no longer shown on Intel CPUs, where the
+  helper it starts has nothing to read.
+
 ## [0.3.0] - 2026-11-07
 
 ### Added

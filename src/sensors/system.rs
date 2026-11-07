@@ -10,6 +10,33 @@ use windows::core::w;
 
 const BYTES_PER_GB: f32 = 1024.0 * 1024.0 * 1024.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuVendor {
+    Amd,
+    Intel,
+    Other,
+}
+
+/// Who made the CPU, from its CPUID vendor string.
+pub fn cpu_vendor() -> CpuVendor {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // CPUID leaf 0 exists on every x86-64 CPU, and only reads registers.
+        let id = std::arch::x86_64::__cpuid(0);
+        let mut vendor = [0u8; 12];
+        vendor[..4].copy_from_slice(&id.ebx.to_le_bytes());
+        vendor[4..8].copy_from_slice(&id.edx.to_le_bytes());
+        vendor[8..].copy_from_slice(&id.ecx.to_le_bytes());
+        match &vendor {
+            b"AuthenticAMD" => CpuVendor::Amd,
+            b"GenuineIntel" => CpuVendor::Intel,
+            _ => CpuVendor::Other,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    CpuVendor::Other
+}
+
 /// Returns (used, total) physical memory in GB.
 pub fn memory_gb() -> Option<(f32, f32)> {
     let mut status = MEMORYSTATUSEX {

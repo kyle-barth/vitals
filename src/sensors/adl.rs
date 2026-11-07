@@ -16,6 +16,8 @@ use windows::Win32::System::LibraryLoader::{
 use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapAlloc};
 use windows::core::{PCSTR, s, w};
 
+use super::GpuReading;
+
 const MAX_SENSORS: usize = 256;
 const AMD_VENDOR_ID: i32 = 1002;
 
@@ -84,17 +86,6 @@ unsafe extern "system" fn adl_alloc(size: i32) -> *mut c_void {
             HeapAlloc(heap, HEAP_FLAGS(0), size.max(0) as usize)
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GpuReading {
-    pub temp_edge: Option<f32>,
-    pub temp_hotspot: Option<f32>,
-    pub temp_memory: Option<f32>,
-    pub load: Option<f32>,
-    pub power_w: Option<f32>,
-    pub fan_rpm: Option<f32>,
-    pub vram_used_mb: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -197,6 +188,11 @@ impl Adl {
         }
     }
 
+    /// Whether a discrete AMD GPU was found, rather than only the integrated one.
+    pub fn has_discrete(&self) -> bool {
+        self.discrete.is_some()
+    }
+
     pub fn gpu(&self) -> GpuReading {
         let Some(adapter) = self.discrete else {
             return GpuReading::default();
@@ -219,6 +215,7 @@ impl Adl {
             power_w: log.get(sensor::BOARD_POWER).or(log.get(sensor::ASIC_POWER)),
             fan_rpm: log.get(sensor::FAN_RPM),
             vram_used_mb,
+            ..GpuReading::default()
         }
     }
 
