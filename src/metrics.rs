@@ -1,6 +1,6 @@
 //! The set of things Vitals tracks, and the state kept for each one.
 
-use crate::apps::BusyApp;
+use crate::apps::{AppRow, BusyApp};
 use crate::history::Series;
 use crate::severity::{Limits, Severity};
 
@@ -198,6 +198,7 @@ pub struct Snapshot {
     pub threads: Vec<f32>,
     pub core: CoreStatus,
     pub apps: Vec<BusyApp>,
+    pub table: Vec<AppRow>,
 }
 
 impl Default for Snapshot {
@@ -209,6 +210,7 @@ impl Default for Snapshot {
             threads: Vec::new(),
             core: CoreStatus::Off,
             apps: Vec::new(),
+            table: Vec::new(),
         }
     }
 }
@@ -252,6 +254,8 @@ pub struct Monitor {
     pub threads: Vec<f32>,
     pub core: CoreStatus,
     pub apps: Vec<BusyApp>,
+    /// Every app, while the Apps view is open.
+    pub table: Vec<AppRow>,
 }
 
 impl Monitor {
@@ -267,9 +271,9 @@ impl Monitor {
             reading.series.push(value);
             reading.value = value;
             if let Some(v) = value {
+                reading.peak = Some(reading.peak.map_or(v, |p| p.max(v)));
                 if let Some(limits) = spec.limits {
                     reading.severity = limits.classify(v, reading.severity);
-                    reading.peak = Some(reading.peak.map_or(v, |p| p.max(v)));
                 }
             } else {
                 reading.severity = Severity::Normal;
@@ -280,6 +284,7 @@ impl Monitor {
         self.threads = snapshot.threads;
         self.core = snapshot.core;
         self.apps = snapshot.apps;
+        self.table = snapshot.table;
     }
 
     pub fn reset_peak(&mut self, id: MetricId) {
@@ -356,6 +361,14 @@ mod tests {
         assert_eq!(m.get(MetricId::GpuHotspot).peak, Some(110.0));
         m.reset_peak(MetricId::GpuHotspot);
         assert_eq!(m.get(MetricId::GpuHotspot).peak, Some(95.0));
+    }
+
+    #[test]
+    fn every_metric_keeps_a_peak_not_only_temperatures() {
+        let mut m = Monitor::default();
+        m.update(snapshot(MetricId::CpuLoad, 54.0));
+        m.update(snapshot(MetricId::CpuLoad, 19.0));
+        assert_eq!(m.get(MetricId::CpuLoad).peak, Some(54.0));
     }
 
     #[test]

@@ -1,11 +1,13 @@
 # 🩺 Vitals
 
-A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of about 450 KB, with nothing to install.
+A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of about 500 KB, with nothing to install.
 
 <p align="center">
   <img src="docs/images/default.png" width="340" alt="Vitals at its default size: twelve tiles showing temperatures, memory, load and power, each with a live history line">
   <img src="docs/images/busy.png" width="340" alt="Vitals with the Busy list showing: a red row for a frozen app with an End button, and a row for an app using 37% of the CPU">
 </p>
+
+<p align="center"><sub>Screenshots use sample values.</sub></p>
 
 ## ⬇️ Download
 
@@ -21,9 +23,11 @@ A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of 
 - 📈 **Live stats:** load, power, memory, disk, network and fan speed, with history lines
 - 🚦 **Warnings:** Warm adds a label, Hot tints the tile and Critical turns it red. Serious ones also reach the title bar and taskbar, so you can see them while a game covers the window.
 - 🔥 **Busy apps:** only shown when an app is using a lot, with End and a "not responding" warning
+- 📋 **Apps view:** every app in a sortable table, like Task Manager
+- 🎚️ **Simple or Advanced:** Simple shows just the numbers. Advanced adds peaks, 2-minute averages and history.
 - 📌 **Pin:** keeps the window on top. Position, size and pin state are remembered.
 - 🌗 **Themes:** light and dark, following Windows
-- 🪶 **Light:** about 0.7% of one CPU thread and 35 MB of memory at the default size
+- 🪶 **Light:** about 1% of one CPU thread and 36 MB of memory at the default size
 
 <details>
 <summary>🌡️ Temperature limits</summary>
@@ -40,8 +44,20 @@ A warning clears once the value is 3° below its limit, so it doesn't flicker. L
 
 </details>
 
+## 🎚️ Simple and Advanced
+
+<p align="center">
+  <img src="docs/images/simple.png" width="340" alt="Vitals in Simple mode: twelve tiles showing only large numbers">
+</p>
+
+- 🪟 Window size decides how many things you see. Simple or Advanced decides how much you see about each one.
+- 🔢 **Simple** keeps the number, memory bars and warnings
+- 📈 **Advanced** adds the peak, the average over the last 2 minutes and a history line
+- 🖱️ Switch between them from the menu beside the pin. Advanced is the default.
+
 ## 📐 Any size
 
+- 🗔 **Size menu:** the button beside the pin jumps to Small (320 × 72), Medium (340 × 520) or Large (1240 × 760), and back to your own size. The window stays in its corner of the screen.
 - ➖ **Slim strip:** up to about 145 px tall, with one or two lines of key numbers. Controls appear on hover, and you can drag it from anywhere.
 - 📏 **Narrow:** under 240 px wide, with a single column of up to 11 rows
 - 🔲 **Grid:** 2 to 4 columns, ordered by importance
@@ -69,9 +85,24 @@ To keep the window calm:
 - 🧩 Processes are grouped by exe, so a browser counts as one app
 - 📋 Rows keep their order, so End can't shift under your pointer. At most 3 show, or 6 in a wide window.
 
-### 🛑 Ending an app
+## 📋 Apps view
 
-Hover a row to reveal **End**, then confirm. Keep, Esc or clicking elsewhere cancels.
+<p align="center">
+  <img src="docs/images/apps.png" width="460" alt="The Apps tab: a table of apps with columns for CPU, memory, GPU, VRAM and disk, sorted by CPU, with a frozen app in red at the top">
+</p>
+
+- 🗂️ **Open it** from the Apps tab, or click a row in the Busy list to see that app in the full list
+- ↕️ **Sort** by clicking a heading. Click again to reverse it. Frozen apps always stay on top.
+- 📏 **Narrow windows** show fewer columns. Click the last heading again to move on to the next one.
+- 🎚️ **Simple mode** keeps to CPU and Memory. Advanced shows every column that fits, and each app's process count.
+- ✋ **Rows hold still** while your pointer is over the list, so End can't move away from you
+- 🔌 **Costs nothing extra when closed:** per-app GPU figures are only read while the table is open, or while the GPU is busy
+- 💾 **Disk** counts everything an app reads and writes, which can include network traffic, so it won't always match Task Manager
+- 🌐 **There is no Network column**, because there is no cheap way to measure it per app
+
+## 🛑 Ending an app
+
+Hover a row in the Busy list or the Apps view to reveal **End**, then confirm. Keep, Esc or clicking elsewhere cancels.
 
 - 💥 **End is immediate:** every process of that app stops at once, and unsaved work is lost
 - 🥶 **Frozen apps** show End straight away, with their CPU use. Windows also says "not responding" when an app is only busy, so one still using CPU may recover if you wait, while 0% suggests it's stuck.

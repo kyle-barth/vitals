@@ -5,6 +5,21 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+### Added
+
+- An Apps tab with every app in a table, showing CPU, memory, GPU, video memory
+  and disk. Click a heading to sort, and hover a row to end that app. Clicking a
+  row in the Busy list opens the table.
+- Simple and Advanced modes. Simple shows just the numbers. Advanced adds a peak
+  on every tile, the 2-minute average and history.
+- A menu beside the pin with Small, Medium and Large window sizes, your own size,
+  and the switch between Simple and Advanced.
+
+### Changed
+
+- New windows open at the Medium size, 340 × 520.
+- Clicking any tile now resets its peak, since every tile has one.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added

@@ -5,13 +5,16 @@
 //! at every severity except critical, and each status also carries a text
 //! label, so it is never signalled by color alone.
 
-use crate::apps::BusyApp;
+use std::sync::Arc;
+
+use crate::apps::{AppRow, BusyApp, Icon, Sort, SortKey};
 use crate::gfx::{Align, Canvas, Color, Weight};
 use crate::history::{CAPACITY, Series};
 use crate::layout::{
-    Button, Cell, Layout, Mode, PAD, Rect, StripItem, StripPlan, TITLE_H, confirm_buttons,
-    end_button, plan_strip,
+    Button, Cell, Layout, Mode, PAD, Page, Rect, StripItem, StripPlan, TABLE_ROW_PAD, TITLE_H,
+    Table, confirm_buttons, end_button, plan_strip,
 };
+use crate::menu::{Action, Plan};
 use crate::metrics::{CoreStatus, MetricId, Monitor, Scale, Unit};
 use crate::severity::Severity;
 
@@ -25,7 +28,12 @@ const TILE_RADIUS: f32 = 6.0;
 const INSET: f32 = 10.0;
 const MIN_NUMBER: f32 = 20.0;
 const MAX_NUMBER: f32 = 72.0;
+const SIMPLE_MAX_NUMBER: f32 = 96.0;
 const MEMORY_SPARK_MIN_H: f32 = 110.0;
+/// A wide tile this tall has room for a line of history under its number.
+const STACKED_MIN_H: f32 = 60.0;
+/// A Simple tile this tall has room for its bar under the number.
+const SIMPLE_BAR_MIN_H: f32 = 58.0;
 
 pub struct Theme {
     surface: Color,
@@ -64,6 +72,10 @@ pub struct Hover {
     pub button: Option<Button>,
     /// The row of the busy app under the pointer.
     pub app: Option<usize>,
+    pub tab: Option<Page>,
+    /// The line of the Apps table under the pointer, counted from its first line.
+    pub row: Option<usize>,
+    pub heading: Option<SortKey>,
 }
 
 pub struct View<'a> {
@@ -76,6 +88,12 @@ pub struct View<'a> {
     pub confirm: Option<&'a str>,
     /// A short message on one app's row: its key, then the text.
     pub notice: Option<(&'a str, &'a str)>,
+    /// Show only the numbers, rather than the full detail on each tile.
+    pub simple: bool,
+    pub sort: Sort,
+    /// How many lines of the Apps table are scrolled off the top.
+    pub scroll: usize,
+    pub menu_open: bool,
 }
 
 /// The colors for one tile at a given severity.
@@ -152,6 +170,10 @@ pub fn paint(c: &Canvas, v: &View) {
     }
     c.clear(v.theme.surface);
     paint_title_bar(c, v);
+    if let Some(table) = &v.layout.table {
+        paint_table(c, v, table);
+        return;
+    }
     for cell in &v.layout.cells {
         match v.layout.mode {
             Mode::Rows => paint_row(c, v, cell),
@@ -189,14 +211,43 @@ fn frozen_status(cpu_percent: f32, room: f32, width: impl Fn(&str) -> f32) -> St
         .unwrap_or_else(|| "Not responding".to_string())
 }
 
-fn paint_app_icon(c: &Canvas, v: &View, app: &BusyApp, x: f32, y: f32) {
+/// Spells out a frozen app's status on two lines. Stacked rather than dropped, so
+/// the status is never left to the color alone.
+fn paint_frozen_lines(c: &Canvas, name: &str, cpu: f32, (x, y): (f32, f32), room: f32, ink: Color) {
+    let name = c.fit(name, 11.0, Weight::Semibold, room);
+    let status = frozen_status(cpu, room, |text| c.measure(text, 10.0, Weight::Regular));
+    c.text_mid(
+        &name,
+        (x, y - STACK_OFFSET),
+        11.0,
+        Weight::Semibold,
+        Align::Left,
+        ink,
+    );
+    c.text_mid(
+        &status,
+        (x, y + STACK_OFFSET),
+        10.0,
+        Weight::Regular,
+        Align::Left,
+        ink,
+    );
+}
+
+fn paint_app_icon(
+    c: &Canvas,
+    v: &View,
+    (key, name): (&str, &str),
+    icon: Option<&Arc<Icon>>,
+    (x, y): (f32, f32),
+) {
     let area = Rect::new(x, y - ICON_SIZE / 2.0, ICON_SIZE, ICON_SIZE);
-    if let Some(icon) = &app.icon {
-        c.icon(&app.key, icon, area);
+    if let Some(icon) = icon {
+        c.icon(key, icon, area);
         return;
     }
     c.fill_round(area, 3.0, v.theme.track);
-    let letter: String = app.name.chars().take(1).collect();
+    let letter: String = name.chars().take(1).collect();
     c.text_mid(
         &letter.to_uppercase(),
         (x + ICON_SIZE / 2.0, y),
@@ -222,7 +273,7 @@ fn paint_control(c: &Canvas, r: Rect, label: &str, fill: Color, ink: Color) {
 
 fn paint_app_row(c: &Canvas, v: &View, app: &BusyApp, index: usize, r: Rect, flat: bool) {
     if v.confirm == Some(app.key.as_str()) {
-        paint_confirm(c, app, r);
+        paint_confirm(c, &app.name, r);
         return;
     }
     let hovered = v.hover.app == Some(index);
@@ -236,7 +287,7 @@ fn paint_app_row(c: &Canvas, v: &View, app: &BusyApp, index: usize, r: Rect, fla
 
     let y = r.y + r.h / 2.0;
     let left = r.x + 8.0;
-    paint_app_icon(c, v, app, left, y);
+    paint_app_icon(c, v, (&app.key, &app.name), app.icon.as_ref(), (left, y));
 
     let mut right = r.right() - 6.0;
     let shows_end = app.can_end && (app.frozen || hovered);
@@ -284,26 +335,12 @@ fn paint_app_row(c: &Canvas, v: &View, app: &BusyApp, index: usize, r: Rect, fla
                 name_ink,
             );
         } else {
-            // Stacked rather than dropped, so the status is always spelled out
-            // and never left to the color alone.
-            let name = c.fit(&app.name, 11.0, Weight::Semibold, name_room);
-            let status = frozen_status(app.cpu_percent, name_room, |text| {
-                c.measure(text, 10.0, Weight::Regular)
-            });
-            c.text_mid(
-                &name,
-                (name_x, y - STACK_OFFSET),
-                11.0,
-                Weight::Semibold,
-                Align::Left,
-                name_ink,
-            );
-            c.text_mid(
-                &status,
-                (name_x, y + STACK_OFFSET),
-                10.0,
-                Weight::Regular,
-                Align::Left,
+            paint_frozen_lines(
+                c,
+                &app.name,
+                app.cpu_percent,
+                (name_x, y),
+                name_room,
                 name_ink,
             );
         }
@@ -351,14 +388,14 @@ fn paint_app_row(c: &Canvas, v: &View, app: &BusyApp, index: usize, r: Rect, fla
 }
 
 /// Asks once more, in place, before ending an app.
-fn paint_confirm(c: &Canvas, app: &BusyApp, r: Rect) {
+fn paint_confirm(c: &Canvas, name: &str, r: Rect) {
     c.fill_round(r, TILE_RADIUS, CRITICAL);
     let (end, keep) = confirm_buttons(r);
     let room = end.x - r.x - 16.0;
     let asks = [
-        format!("End {}? Unsaved work will be lost.", app.name),
-        format!("End {}? Unsaved work is lost.", app.name),
-        format!("End {}?", app.name),
+        format!("End {name}? Unsaved work will be lost."),
+        format!("End {name}? Unsaved work is lost."),
+        format!("End {name}?"),
     ];
     let question = asks
         .iter()
@@ -377,13 +414,57 @@ fn paint_confirm(c: &Canvas, app: &BusyApp, r: Rect) {
     paint_control(c, keep, "Keep", WHITE.with_alpha(0.22), WHITE);
 }
 
+const ALERT_GAP: f32 = 8.0;
+const ALERT_DOT_SPACE: f32 = 16.0;
+
+fn paint_tabs(c: &Canvas, v: &View) {
+    for &(page, r) in &v.layout.tabs {
+        let label = match page {
+            Page::Vitals => "Vitals",
+            Page::Apps => "Apps",
+        };
+        let ink = if page == v.layout.page {
+            v.theme.ink
+        } else if v.hover.tab == Some(page) {
+            v.theme.ink2
+        } else {
+            v.theme.ink3
+        };
+        c.text_mid(
+            label,
+            (r.x + r.w / 2.0, r.y + r.h / 2.0),
+            12.0,
+            Weight::Semibold,
+            Align::Center,
+            ink,
+        );
+    }
+}
+
 fn paint_title_bar(c: &Canvas, v: &View) {
     let y = TITLE_H / 2.0;
+    let tabs_end = v.layout.tabs.last().map_or(0.0, |(_, r)| r.right());
+    let buttons_start = v
+        .layout
+        .buttons
+        .iter()
+        .fold(v.layout.width, |x, (_, r)| x.min(r.x));
     match alert_text(v.layout, v.monitor) {
         Some(alert) => {
+            // An alert sits beside the tabs when it can. Otherwise it takes their
+            // place, because it matters more and they still answer to clicks.
+            let room = buttons_start - tabs_end - ALERT_GAP;
+            let width = ALERT_DOT_SPACE + c.measure(&alert, 12.0, Weight::Semibold);
+            let beside = width <= room;
+            let x = if beside {
+                paint_tabs(c, v);
+                tabs_end + ALERT_GAP
+            } else {
+                PAD
+            };
             let severity = v.monitor.worst_severity();
             c.circle(
-                PAD + 6.0,
+                x + 6.0,
                 y,
                 4.0,
                 if severity == Severity::Critical {
@@ -394,23 +475,14 @@ fn paint_title_bar(c: &Canvas, v: &View) {
             );
             c.text_mid(
                 &alert,
-                (PAD + 16.0, y),
+                (x + ALERT_DOT_SPACE, y),
                 12.0,
                 Weight::Semibold,
                 Align::Left,
                 v.theme.ink,
             );
         }
-        None => {
-            c.text_mid(
-                "Vitals",
-                (PAD + 2.0, y),
-                12.0,
-                Weight::Semibold,
-                Align::Left,
-                v.theme.ink2,
-            );
-        }
+        None => paint_tabs(c, v),
     }
     for &(button, rect) in &v.layout.buttons {
         paint_button(c, v, button, rect);
@@ -441,6 +513,11 @@ fn paint_button(c: &Canvas, v: &View, button: Button, r: Rect) {
         }
         Button::Maximize => c.outline_rect(Rect::new(x - S, y - S, S * 2.0, S * 2.0), 1.1, color),
         Button::Minimize => c.line((x - S, y), (x + S, y), 1.2, color),
+        Button::Menu => {
+            let mark = if v.menu_open { v.theme.accent } else { color };
+            c.outline_rect(Rect::new(x - 5.5, y - 4.5, 11.0, 9.0), 1.1, mark);
+            c.outline_rect(Rect::new(x - 3.0, y - 1.0, 3.5, 3.0), 1.1, mark);
+        }
         Button::Pin => {
             let mark = if v.pinned { v.theme.accent } else { color };
             if v.pinned {
@@ -462,6 +539,23 @@ fn value_parts(metric: MetricId, value: Option<f32>) -> (String, &'static str) {
     }
 }
 
+/// A value with just enough of its unit to read on its own.
+fn with_unit(metric: MetricId, value: f32) -> String {
+    let unit = metric.spec().unit;
+    let number = unit.format(value);
+    match unit {
+        Unit::Celsius | Unit::Percent => format!("{number}{}", unit.suffix()),
+        Unit::Watts => format!("{number} W"),
+        _ => number,
+    }
+}
+
+/// The average over the history a tile holds, which is two minutes when full.
+fn average_text(metric: MetricId, monitor: &Monitor) -> Option<String> {
+    let average = monitor.get(metric).series.average()?;
+    Some(format!("Avg {}", with_unit(metric, average)))
+}
+
 /// Short text beside the number: the session peak, the installed capacity, or
 /// a prompt explaining how to get a true CPU core reading.
 fn note(metric: MetricId, monitor: &Monitor) -> Option<String> {
@@ -479,7 +573,7 @@ fn note(metric: MetricId, monitor: &Monitor) -> Option<String> {
         MetricId::VideoMemory => monitor.vram_total_gb.map(|t| format!("of {t:.0} GB")),
         _ => {
             let peak = monitor.get(metric).peak?;
-            Some(format!("Peak {peak:.0}°"))
+            Some(format!("Peak {}", with_unit(metric, peak)))
         }
     }
 }
@@ -522,6 +616,10 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
     } else {
         c.circle(right - 4.0, title_y, 4.0, status_color(reading.severity));
     }
+    if v.simple {
+        paint_simple_tile(c, v, metric, r, chip_fits, &style);
+        return;
+    }
 
     let size = (r.h * 0.34).min(r.w * 0.22).clamp(MIN_NUMBER, MAX_NUMBER);
     let baseline = r.y + 24.0 + size * 0.86;
@@ -530,6 +628,10 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
     let wide = r.w > r.h * 2.0;
     let bar = capacity(metric, v.monitor);
     let bar_top = r.bottom() - 15.0;
+    let average = average_text(metric, v.monitor);
+    // With the height for it, the history goes under the number and the row
+    // beside the number is free for the average.
+    let stacked = wide && bar.is_none() && r.h >= STACKED_MIN_H;
     let note_text = if chip_fits {
         note(metric, v.monitor)
     } else {
@@ -558,9 +660,30 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
                 Align::Right,
                 style.ink2,
             );
+            if let Some(average) = average.as_ref().filter(|_| stacked) {
+                let average_w = c.measure(average, 11.0, Weight::Regular);
+                if number_right + 8.0 + average_w <= right {
+                    c.text(
+                        average,
+                        (right, baseline),
+                        11.0,
+                        Weight::Regular,
+                        Align::Right,
+                        style.ink2,
+                    );
+                }
+            }
         } else if number_right + 8.0 + note_w <= right {
+            // A tall tile says both on the one line, if they fit.
+            let both = average
+                .as_ref()
+                .filter(|_| !wide && bar.is_none())
+                .map(|average| format!("{average}  ·  {text}"))
+                .filter(|both| {
+                    number_right + 8.0 + c.measure(both, 11.0, Weight::Regular) <= right
+                });
             c.text(
-                text,
+                both.as_deref().unwrap_or(text),
                 (right, baseline),
                 11.0,
                 Weight::Regular,
@@ -573,7 +696,10 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
         }
     }
 
-    let plot = if wide {
+    let plot = if stacked {
+        let top = baseline + 4.0;
+        Rect::new(left, top, right - left, r.bottom() - 6.0 - top)
+    } else if wide {
         let bottom = if bar.is_some() {
             bar_top - 6.0
         } else {
@@ -615,6 +741,62 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
     let has_room = bar.is_none() || wide || r.h > MEMORY_SPARK_MIN_H;
     if (has_room && !short) || (bar.is_none() && wide) {
         paint_spark(c, v.monitor, metric, plot, &style);
+    }
+}
+
+/// A tile in Simple mode: the number, and only what can't be left out.
+fn paint_simple_tile(
+    c: &Canvas,
+    v: &View,
+    metric: MetricId,
+    r: Rect,
+    chip_fits: bool,
+    style: &Look,
+) {
+    const TITLE_SPACE: f32 = 22.0;
+    const BAR_SPACE: f32 = 15.0;
+    let reading = v.monitor.get(metric);
+    let (left, right) = (r.x + INSET, r.right() - INSET);
+    let size = ((r.h - 28.0) * 0.8)
+        .min(r.w * 0.24)
+        .clamp(MIN_NUMBER, SIMPLE_MAX_NUMBER);
+    let space = r.h - TITLE_SPACE - BAR_SPACE;
+    let baseline = r.y + TITLE_SPACE + (space + size * 0.7) / 2.0;
+    let number_right = paint_number(c, metric, reading.value, left, baseline, size, style);
+
+    if let Some(total) = capacity(metric, v.monitor).filter(|t| *t > 0.0) {
+        let fill = reading.value.unwrap_or(0.0) / total;
+        let area = if r.h >= SIMPLE_BAR_MIN_H {
+            Rect::new(left, r.bottom() - BAR_SPACE, right - left, 6.0)
+        } else {
+            let x = number_right + 14.0;
+            Rect::new(x, baseline - size * 0.35 - 3.0, right - x, 6.0)
+        };
+        if area.w > 24.0 {
+            meter(c, area, fill, style.mark, style.track);
+        }
+    }
+
+    // The way to a true core reading stays, as nothing else offers it, and so
+    // does a status word that didn't fit on the title row.
+    let text = if !chip_fits {
+        Some(reading.severity.label().to_string())
+    } else if metric == MetricId::IoDieTemp {
+        note(metric, v.monitor)
+    } else {
+        None
+    };
+    if let Some(text) = text {
+        if number_right + 8.0 + c.measure(&text, 11.0, Weight::Regular) <= right {
+            c.text(
+                &text,
+                (right, baseline),
+                11.0,
+                Weight::Regular,
+                Align::Right,
+                style.ink2,
+            );
+        }
     }
 }
 
@@ -782,7 +964,13 @@ fn paint_row(c: &Canvas, v: &View, cell: &Cell) {
     c.fill_round(r, TILE_RADIUS, style.fill);
 
     let (left, right) = (r.x + 8.0, r.right() - 8.0);
-    let y = r.y + 14.0;
+    let total = capacity(metric, v.monitor).filter(|t| *t > 0.0);
+    let centered = v.simple && total.is_none();
+    let y = if centered {
+        r.y + r.h / 2.0
+    } else {
+        r.y + 14.0
+    };
     c.text_mid(
         metric.spec().label,
         (left, y),
@@ -792,7 +980,11 @@ fn paint_row(c: &Canvas, v: &View, cell: &Cell) {
         style.ink2,
     );
 
-    let size = (r.h * 0.36).clamp(15.0, 22.0);
+    let size = if centered {
+        (r.h * 0.5).clamp(15.0, 30.0)
+    } else {
+        (r.h * 0.36).clamp(15.0, 22.0)
+    };
     let (number, suffix) = value_parts(metric, reading.value);
     let unit_size = if suffix == "°" { size } else { 11.0 };
     let unit_w = c.text(
@@ -819,7 +1011,7 @@ fn paint_row(c: &Canvas, v: &View, cell: &Cell) {
 
     let top = r.y + 27.0;
     let area = Rect::new(left, top, right - left, r.bottom() - top - 6.0);
-    match capacity(metric, v.monitor).filter(|t| *t > 0.0) {
+    match total {
         Some(total) => {
             let bar = Rect::new(left, r.bottom() - 12.0, right - left, 5.0);
             meter(
@@ -830,6 +1022,7 @@ fn paint_row(c: &Canvas, v: &View, cell: &Cell) {
                 style.track,
             );
         }
+        None if v.simple => {}
         None => paint_spark(c, v.monitor, metric, area, &style),
     }
 }
@@ -910,6 +1103,321 @@ fn strip_entry(item: StripItem, monitor: &Monitor) -> (&'static str, String, Sev
             percent(MetricId::VideoMemory, monitor.vram_total_gb),
             Severity::Normal,
         ),
+    }
+}
+
+/// The key numbers above the Apps table, which is all of the sensors it leaves
+/// room for. It shows as many as fit, in the same order as the strip.
+fn paint_summary(c: &Canvas, v: &View, area: Rect) {
+    use StripItem::*;
+    const LABEL: f32 = 11.0;
+    const VALUE: f32 = 13.0;
+    const ITEM_GAP: f32 = 12.0;
+    let y = area.y + area.h / 2.0;
+    let mut x = area.x + TABLE_ROW_PAD;
+    for item in [Cpu, Gpu, Hotspot, Ram, Vram] {
+        let (label, value, severity) = strip_entry(item, v.monitor);
+        let dot = if severity == Severity::Normal {
+            0.0
+        } else {
+            STRIP_DOT_SPACE
+        };
+        let width = c.measure(label, LABEL, Weight::Regular)
+            + STRIP_LABEL_GAP
+            + c.measure(&value, VALUE, Weight::Semibold)
+            + dot;
+        if x + width > area.right() {
+            break;
+        }
+        x += c.text_mid(
+            label,
+            (x, y),
+            LABEL,
+            Weight::Regular,
+            Align::Left,
+            v.theme.ink3,
+        );
+        x += STRIP_LABEL_GAP;
+        x += c.text_mid(
+            &value,
+            (x, y),
+            VALUE,
+            Weight::Semibold,
+            Align::Left,
+            v.theme.ink,
+        );
+        if dot > 0.0 {
+            c.circle(x + 7.0, y, 3.5, status_color(severity));
+            x += dot;
+        }
+        x += ITEM_GAP;
+    }
+}
+
+fn paint_heading(c: &Canvas, v: &View, key: SortKey, (x, y): (f32, f32), align: Align) {
+    let sorted = v.sort.key == key;
+    let ink = if sorted {
+        v.theme.ink
+    } else if v.hover.heading == Some(key) {
+        v.theme.ink2
+    } else {
+        v.theme.ink3
+    };
+    let width = c.text_mid(key.label(), (x, y), 11.0, Weight::Semibold, align, ink);
+    if sorted {
+        let arrow_x = match align {
+            Align::Right => x - width - 7.0,
+            _ => x + width + 7.0,
+        };
+        let tip = if v.sort.descending { 1.5 } else { -1.5 };
+        c.polyline(
+            &[
+                (arrow_x - 3.0, y - tip),
+                (arrow_x, y + tip),
+                (arrow_x + 3.0, y - tip),
+            ],
+            1.2,
+            ink,
+        );
+    }
+}
+
+fn paint_table(c: &Canvas, v: &View, table: &Table) {
+    if let Some(area) = table.summary {
+        paint_summary(c, v, area);
+    }
+    let header = table.header;
+    let y = header.y + header.h / 2.0;
+    paint_heading(
+        c,
+        v,
+        SortKey::Name,
+        (header.x + TABLE_ROW_PAD, y),
+        Align::Left,
+    );
+    for &(key, right) in &table.columns {
+        paint_heading(c, v, key, (right, y), Align::Right);
+    }
+    c.fill_round(
+        Rect::new(header.x, header.bottom() - 1.0, header.w, 1.0),
+        0.0,
+        v.theme.track,
+    );
+
+    let rows = &v.monitor.table;
+    if rows.is_empty() {
+        c.text_mid(
+            "Reading apps",
+            (table.body.x + table.body.w / 2.0, table.body.y + 20.0),
+            12.0,
+            Weight::Regular,
+            Align::Center,
+            v.theme.ink3,
+        );
+        return;
+    }
+    for (slot, row) in rows.iter().skip(v.scroll).take(table.visible).enumerate() {
+        paint_table_row(c, v, table, row, v.scroll + slot, table.row(slot));
+    }
+
+    // A thin mark shows where the view is in the list. The wheel moves it.
+    if rows.len() > table.visible {
+        let body = table.body;
+        let share = table.visible as f32 / rows.len() as f32;
+        let height = (body.h * share).max(20.0);
+        let span = (rows.len() - table.visible) as f32;
+        let top = body.y + (body.h - height) * (v.scroll as f32 / span);
+        c.fill_round(
+            Rect::new(body.right() + 2.0, top, 3.0, height),
+            1.5,
+            v.theme.track,
+        );
+    }
+}
+
+fn paint_table_row(c: &Canvas, v: &View, table: &Table, row: &AppRow, index: usize, r: Rect) {
+    if v.confirm == Some(row.key.as_str()) {
+        paint_confirm(c, &row.name, r);
+        return;
+    }
+    let hovered = v.hover.row == Some(index);
+    if row.frozen {
+        c.fill_round(r, 4.0, CRITICAL);
+    } else if hovered {
+        c.fill_round(r, 4.0, v.theme.raised);
+    }
+    let ink = if row.frozen { WHITE } else { v.theme.ink };
+    let faded = if row.frozen { WHITE } else { v.theme.ink3 };
+
+    let y = r.y + r.h / 2.0;
+    let left = r.x + TABLE_ROW_PAD;
+    paint_app_icon(c, v, (&row.key, &row.name), row.icon.as_ref(), (left, y));
+
+    let shows_end = row.can_end && (row.frozen || hovered);
+    let button = end_button(r);
+    let cells_start = if shows_end && table.columns.len() == 1 {
+        button.x
+    } else {
+        table.names_end()
+    };
+    let name_x = left + ICON_SIZE + 6.0;
+    let room = cells_start - name_x - 6.0;
+
+    if row.frozen {
+        let full = format!("{} not responding", row.name);
+        if c.measure(&full, 12.0, Weight::Semibold) <= room {
+            c.text_mid(&full, (name_x, y), 12.0, Weight::Semibold, Align::Left, ink);
+        } else {
+            paint_frozen_lines(c, &row.name, row.usage.cpu, (name_x, y), room, ink);
+        }
+    } else {
+        let count = row.processes.len();
+        let suffix = (!v.simple && count > 1).then(|| count.to_string());
+        let suffix_w = suffix
+            .as_deref()
+            .map_or(0.0, |s| c.measure(s, 10.0, Weight::Regular) + 5.0);
+        let name = c.fit(&row.name, 12.0, Weight::Regular, room - suffix_w);
+        let name_w = c.text_mid(&name, (name_x, y), 12.0, Weight::Regular, Align::Left, ink);
+        if let Some(suffix) = suffix {
+            c.text_mid(
+                &suffix,
+                (name_x + name_w + 5.0, y),
+                10.0,
+                Weight::Regular,
+                Align::Left,
+                faded,
+            );
+        }
+    }
+
+    let notice = v
+        .notice
+        .filter(|(key, _)| *key == row.key)
+        .map(|(_, text)| text);
+    let end_edge = if shows_end { button.x } else { r.right() };
+    if let Some(text) = notice {
+        c.text_mid(
+            text,
+            (end_edge - 4.0, y),
+            11.0,
+            Weight::Regular,
+            Align::Right,
+            ink,
+        );
+    } else {
+        for &(key, right) in &table.columns {
+            if right > end_edge {
+                continue;
+            }
+            let weight = if v.sort.key == key {
+                Weight::Semibold
+            } else {
+                Weight::Regular
+            };
+            let color = if row.is_idle(key) { faded } else { ink };
+            c.text_mid(
+                &row.cell(key),
+                (right, y),
+                12.0,
+                weight,
+                Align::Right,
+                color,
+            );
+        }
+    }
+    if shows_end {
+        if row.frozen {
+            paint_control(c, button, "End", WHITE, CRITICAL);
+        } else {
+            paint_control(c, button, "End", CRITICAL, WHITE);
+        }
+    }
+}
+
+/// Paints the menu beside the pin, which is a small window of its own.
+pub fn paint_menu(c: &Canvas, theme: &Theme, plan: &Plan, hover: Option<usize>) {
+    c.clear(theme.raised);
+    let heading = |text: &str, y: f32| {
+        c.text_mid(
+            text,
+            (12.0, y + 9.0),
+            11.0,
+            Weight::Regular,
+            Align::Left,
+            theme.ink3,
+        );
+    };
+    heading("Size", plan.size_heading_y);
+    heading("Show", plan.show_heading_y);
+    c.fill_round(
+        Rect::new(6.0, plan.rule_y, plan.width - 12.0, 1.0),
+        0.0,
+        theme.track,
+    );
+    c.fill_round(plan.switch, 6.0, theme.surface);
+
+    for (index, item) in plan.items.iter().enumerate() {
+        let r = item.rect;
+        let y = r.y + r.h / 2.0;
+        let hovered = hover == Some(index);
+        if matches!(item.action, Action::Simple | Action::Advanced) {
+            if item.ticked {
+                c.fill_round(r, 4.0, theme.track);
+            }
+            let ink = if item.ticked || hovered {
+                theme.ink
+            } else {
+                theme.ink3
+            };
+            c.text_mid(
+                item.label,
+                (r.x + r.w / 2.0, y),
+                12.0,
+                Weight::Semibold,
+                Align::Center,
+                ink,
+            );
+            continue;
+        }
+        if hovered {
+            c.fill_round(r, 4.0, theme.track);
+        }
+        if let Some((width, height)) = item.glyph {
+            let middle = r.x + 17.0;
+            c.outline_rect(
+                Rect::new(middle - width / 2.0, y - height / 2.0, width, height),
+                1.1,
+                theme.ink2,
+            );
+        }
+        c.text_mid(
+            item.label,
+            (r.x + 38.0, y),
+            12.0,
+            Weight::Semibold,
+            Align::Left,
+            theme.ink,
+        );
+        c.text_mid(
+            &item.detail,
+            (r.right() - 22.0, y),
+            11.0,
+            Weight::Regular,
+            Align::Right,
+            theme.ink3,
+        );
+        if item.ticked {
+            let (tick_x, size) = (r.right() - 14.0, 3.5);
+            c.polyline(
+                &[
+                    (tick_x - size, y),
+                    (tick_x - 1.0, y + size - 1.0),
+                    (tick_x + size, y - size),
+                ],
+                1.5,
+                theme.accent,
+            );
+        }
     }
 }
 
@@ -1055,6 +1563,14 @@ mod tests {
     #[test]
     fn the_status_itself_survives_any_width() {
         assert_eq!(frozen_status(16.0, 1.0, chars), "Not responding");
+    }
+
+    #[test]
+    fn values_carry_just_enough_of_their_unit() {
+        assert_eq!(with_unit(MetricId::GpuTemp, 71.6), "72°");
+        assert_eq!(with_unit(MetricId::CpuLoad, 54.0), "54%");
+        assert_eq!(with_unit(MetricId::CpuPower, 81.2), "81 W");
+        assert_eq!(with_unit(MetricId::Download, 6.26), "6.3");
     }
 
     #[test]

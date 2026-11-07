@@ -4,7 +4,7 @@
 //! One `NtQuerySystemInformation` call returns CPU time and memory for every
 //! process at once, without opening any of them. That is why this can run every
 //! second on a PC with hundreds of processes. GPU use per app is far costlier,
-//! so it is only read while the GPU is actually busy.
+//! so it is only read while the GPU is actually busy or the Apps page is open.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -36,9 +36,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HSTRING, PWSTR};
 
 use super::pdh::GpuApps;
-use crate::apps::{AppSample, BusyApp, Capacity, Icon, ProcessId, Tracker, Usage};
+use crate::apps::{AppRow, AppSample, BusyApp, Capacity, Icon, ProcessId, Tracker, Usage};
 
 const BYTES_PER_GB: f32 = 1024.0 * 1024.0 * 1024.0;
+const BYTES_PER_MB: f32 = 1024.0 * 1024.0;
 /// CPU time is reported in units of 100 nanoseconds.
 const TICKS_PER_SECOND: f32 = 10_000_000.0;
 const INITIAL_BUFFER: usize = 1024 * 1024;
@@ -97,6 +98,24 @@ struct Entry {
     parent: usize,
     handles: u32,
     session: u32,
+    process_key: usize,
+    peak_virtual_size: usize,
+    virtual_size: usize,
+    page_faults: u32,
+    peak_working_set: usize,
+    working_set: usize,
+    quota_peak_paged_pool: usize,
+    quota_paged_pool: usize,
+    quota_peak_non_paged_pool: usize,
+    quota_non_paged_pool: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+    private_pages: usize,
+    read_operations: i64,
+    write_operations: i64,
+    other_operations: i64,
+    bytes_read: i64,
+    bytes_written: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +124,8 @@ struct Process {
     session: u32,
     created: i64,
     cpu_time: i64,
+    /// Everything read and written since the process started.
+    io_bytes: i64,
     private_bytes: i64,
     /// The exe's name, without the `.exe`.
     name: String,
@@ -144,6 +165,7 @@ fn parse_processes(buffer: &[u8]) -> Vec<Process> {
             session: entry.session,
             created: entry.created,
             cpu_time: entry.user_time + entry.kernel_time,
+            io_bytes: entry.bytes_read + entry.bytes_written,
             private_bytes: entry.private_bytes,
             name: strip_exe(&name).to_string(),
         });
@@ -437,7 +459,8 @@ struct Group {
 /// Measures every app, once per sample.
 pub struct ProcessSource {
     buffer: Vec<u8>,
-    previous: HashMap<ProcessKey, i64>,
+    /// Each process's CPU time and bytes moved, as of the last sample.
+    previous: HashMap<ProcessKey, (i64, i64)>,
     last_sample: Option<Instant>,
     threads: f32,
     own_name: String,
@@ -466,11 +489,16 @@ impl ProcessSource {
         }
     }
 
-    /// Returns the apps to show right now. `gpu_busy` says whether it's worth
-    /// paying for per-app GPU data on this sample.
-    pub fn busy_apps(&mut self, gpu_busy: bool, capacity: Capacity) -> Vec<BusyApp> {
+    /// Returns the busy apps to show right now, and every app if `wants_table`.
+    /// `gpu_busy` says whether it's worth paying for per-app GPU data otherwise.
+    pub fn apps(
+        &mut self,
+        gpu_busy: bool,
+        capacity: Capacity,
+        wants_table: bool,
+    ) -> (Vec<BusyApp>, Vec<AppRow>) {
         let Some(length) = query_processes(&mut self.buffer) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let processes = parse_processes(&self.buffer[..length.min(self.buffer.len())]);
         let now = Instant::now();
@@ -479,7 +507,7 @@ impl ProcessSource {
             .replace(now)
             .map_or(0.0, |last| (now - last).as_secs_f32());
 
-        let gpu_use = if gpu_busy {
+        let gpu_use = if gpu_busy || wants_table {
             if self.gpu.is_none() {
                 self.gpu = GpuApps::open();
             }
@@ -494,7 +522,7 @@ impl ProcessSource {
         for process in processes {
             let key = process.name.to_lowercase();
             let identity = (process.pid, process.created);
-            current.insert(identity, process.cpu_time);
+            current.insert(identity, (process.cpu_time, process.io_bytes));
             if process.pid == 0 || key == self.own_name || NEVER_LISTED.contains(&key.as_str()) {
                 continue;
             }
@@ -503,10 +531,12 @@ impl ProcessSource {
                 can_end: !NEVER_ENDED.contains(&key.as_str()),
                 ..Default::default()
             });
-            if let Some(before) = self.previous.get(&identity) {
+            if let Some((cpu_before, io_before)) = self.previous.get(&identity) {
                 if seconds > 0.0 {
-                    let busy = (process.cpu_time - before).max(0) as f32 / TICKS_PER_SECOND;
+                    let busy = (process.cpu_time - cpu_before).max(0) as f32 / TICKS_PER_SECOND;
                     group.usage.cpu += busy / seconds / self.threads * 100.0;
+                    let moved = (process.io_bytes - io_before).max(0) as f32 / BYTES_PER_MB;
+                    group.usage.disk_mb += moved / seconds;
                 }
             }
             group.usage.memory_gb += process.private_bytes.max(0) as f32 / BYTES_PER_GB;
@@ -538,30 +568,66 @@ impl ProcessSource {
             .collect();
 
         let shown = self.tracker.update(samples, capacity);
-        shown
-            .into_iter()
-            .map(|app| {
-                let fallback = groups
-                    .get(&app.key)
-                    .map_or(app.key.as_str(), |g| g.name.as_str());
-                let pid = app.processes.first().map_or(0, |p| p.pid);
-                let identity = self
-                    .identities
-                    .entry(app.key.clone())
-                    .or_insert_with(|| read_identity(pid, fallback))
-                    .clone();
-                BusyApp {
-                    labels: app.usage.labels(capacity),
-                    cpu_percent: app.usage.cpu,
-                    key: app.key,
+
+        // Names and icons are read once, then kept only for as long as they are
+        // needed, so closing the Apps page gives their memory back.
+        let wanted = |key: &String| {
+            if wants_table {
+                groups.contains_key(key)
+            } else {
+                shown.iter().any(|app| app.key == *key)
+            }
+        };
+        self.identities.retain(|key, _| wanted(key));
+
+        let table = if wants_table {
+            let mut rows = Vec::with_capacity(groups.len());
+            for (key, group) in &groups {
+                let identity = self.identity(key, group);
+                rows.push(AppRow {
+                    key: key.clone(),
                     name: identity.name,
                     icon: identity.icon,
-                    frozen: app.frozen,
-                    can_end: app.can_end,
-                    processes: app.processes,
-                }
-            })
-            .collect()
+                    usage: group.usage,
+                    frozen: self.tracker.is_frozen(key),
+                    can_end: group.can_end,
+                    processes: group.processes.clone(),
+                });
+            }
+            rows
+        } else {
+            Vec::new()
+        };
+
+        let mut busy = Vec::with_capacity(shown.len());
+        for app in shown {
+            let identity = match groups.get(&app.key) {
+                Some(group) => self.identity(&app.key, group),
+                None => Identity::default(),
+            };
+            busy.push(BusyApp {
+                labels: app.usage.labels(capacity),
+                cpu_percent: app.usage.cpu,
+                biggest: app.usage.biggest(capacity),
+                key: app.key,
+                name: identity.name,
+                icon: identity.icon,
+                frozen: app.frozen,
+                can_end: app.can_end,
+                processes: app.processes,
+            });
+        }
+        (busy, table)
+    }
+
+    fn identity(&mut self, key: &str, group: &Group) -> Identity {
+        if let Some(identity) = self.identities.get(key) {
+            return identity.clone();
+        }
+        let pid = group.processes.first().map_or(0, |p| p.pid);
+        let identity = read_identity(pid, &group.name);
+        self.identities.insert(key.to_string(), identity.clone());
+        identity
     }
 }
 
@@ -646,6 +712,24 @@ mod tests {
                 parent: 0,
                 handles: 1,
                 session: *session,
+                process_key: 0,
+                peak_virtual_size: 0,
+                virtual_size: 0,
+                page_faults: 0,
+                peak_working_set: 0,
+                working_set: 0,
+                quota_peak_paged_pool: 0,
+                quota_paged_pool: 0,
+                quota_peak_non_paged_pool: 0,
+                quota_non_paged_pool: 0,
+                pagefile_usage: 0,
+                peak_pagefile_usage: 0,
+                private_pages: 0,
+                read_operations: 0,
+                write_operations: 0,
+                other_operations: 0,
+                bytes_read: 700,
+                bytes_written: 300,
             };
             // SAFETY: the record is in bounds of `data`.
             unsafe { ptr::write_unaligned(data.as_mut_ptr().add(at).cast::<Entry>(), entry) };
@@ -663,6 +747,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Entry, name), 0x40);
         assert_eq!(std::mem::offset_of!(Entry, pid), 0x50);
         assert_eq!(std::mem::offset_of!(Entry, session), 0x64);
+        assert_eq!(std::mem::offset_of!(Entry, bytes_read), 0xE8);
+        assert_eq!(std::mem::offset_of!(Entry, bytes_written), 0xF0);
     }
 
     #[test]
@@ -673,6 +759,7 @@ mod tests {
         assert_eq!(list[0].name, "Fusion360");
         assert_eq!(list[0].pid, 40);
         assert_eq!(list[0].cpu_time, 42);
+        assert_eq!(list[0].io_bytes, 1000);
         assert_eq!(list[0].created, 100);
         assert_eq!(list[1].name, "node");
         assert_eq!(list[1].private_bytes, 3);

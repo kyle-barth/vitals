@@ -40,6 +40,15 @@ impl Series {
         (0..self.len).map(move |i| self.samples[(start + i) % CAPACITY])
     }
 
+    /// The mean of the values held, ignoring gaps.
+    pub fn average(&self) -> Option<f32> {
+        let (sum, count) = self
+            .iter()
+            .filter(|v| !v.is_nan())
+            .fold((0.0, 0u32), |(sum, count), v| (sum + v, count + 1));
+        (count > 0).then(|| sum / count as f32)
+    }
+
     /// Lowest and highest values, ignoring gaps.
     pub fn bounds(&self) -> Option<(f32, f32)> {
         self.iter()
@@ -54,6 +63,16 @@ impl Series {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_average_skips_gaps() {
+        let mut s = Series::default();
+        assert_eq!(s.average(), None);
+        s.push(Some(10.0));
+        s.push(None);
+        s.push(Some(20.0));
+        assert_eq!(s.average(), Some(15.0));
+    }
 
     #[test]
     fn iterates_oldest_first_after_wrapping() {

@@ -8,6 +8,7 @@ mod gfx;
 mod helper;
 mod history;
 mod layout;
+mod menu;
 mod metrics;
 mod sensors;
 mod settings;

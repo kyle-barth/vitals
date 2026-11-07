@@ -3,7 +3,9 @@
 //! maximize button, rounded corners, shadows and per-monitor DPI scaling.
 
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
@@ -14,7 +16,8 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, MONITOR_DEFAULTTONULL, MonitorFromRect, PAINTSTRUCT,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, MonitorFromWindow, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
@@ -30,9 +33,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, Result, w};
 
+use crate::apps::{self, ProcessId, Sort, SortKey};
 use crate::gfx::Gfx;
 use crate::helper::CoreLink;
-use crate::layout::{self, Button, Layout, Mode, TITLE_H};
+use crate::layout::{self, Button, Layout, Mode, Options, Page, Preset, TITLE_H};
+use crate::menu::{self, Action, MenuState, WM_APP_MENU};
 use crate::metrics::{CoreStatus, MetricId, Monitor};
 use crate::sensors::processes::{EndOutcome, end_app};
 use crate::sensors::{Latest, Sampler};
@@ -52,7 +57,12 @@ const NEEDS_ADMIN: &str = "Needs admin to end";
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_NCMOUSELEAVE: u32 = 0x02A2;
 const BASE_DPI: f32 = 96.0;
-const DEFAULT_SIZE: (i32, i32) = (340, 470);
+/// Lines of the Apps table moved by one notch of the wheel.
+const WHEEL_LINES: f32 = 3.0;
+const WHEEL_NOTCH: f32 = 120.0;
+/// Clicking the menu's button while it is open closes the menu by taking focus.
+/// That click must not then open it again.
+const MENU_REOPEN_DELAY: Duration = Duration::from_millis(300);
 /// Narrower than this and the strip could not show all three temperatures.
 const MIN_SIZE: (i32, i32) = (190, 36);
 const EDGE: f32 = 5.0;
@@ -65,9 +75,22 @@ const TOP_EDGE: f32 = 3.0;
 enum Deferred {
     SetTitle(HSTRING),
     Show(SHOW_WINDOW_CMD),
-    Pin { on_top: bool },
+    Pin {
+        on_top: bool,
+    },
     Place(RECT),
-    TitleBarTheme { dark: bool },
+    /// Resizes to a size in device-independent pixels, keeping to the screen.
+    Resize((i32, i32)),
+    TitleBarTheme {
+        dark: bool,
+    },
+    OpenMenu {
+        anchor: (i32, i32),
+        above: i32,
+        state: MenuState,
+        dark: bool,
+        topmost: bool,
+    },
 }
 
 impl Deferred {
@@ -91,6 +114,42 @@ impl Deferred {
                     let (width, height) = (r.right - r.left, r.bottom - r.top);
                     let flags = SWP_NOZORDER | SWP_NOACTIVATE;
                     let _ = SetWindowPos(hwnd, None, r.left, r.top, width, height, flags);
+                }
+                Deferred::Resize((width, height)) => {
+                    let scale = GetDpiForWindow(hwnd) as f32 / BASE_DPI;
+                    let mut now = RECT::default();
+                    let mut info = MONITORINFO {
+                        cbSize: size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    if GetWindowRect(hwnd, &mut now).is_ok()
+                        && GetMonitorInfoW(monitor, &mut info).as_bool()
+                    {
+                        let work = info.rcWork;
+                        let (left, top, right, bottom) = layout::fit_window(
+                            (now.left, now.top, now.right, now.bottom),
+                            (work.left, work.top, work.right, work.bottom),
+                            (
+                                (width as f32 * scale).round() as i32,
+                                (height as f32 * scale).round() as i32,
+                            ),
+                        );
+                        let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+                        let (w, h) = (right - left, bottom - top);
+                        let _ = SetWindowPos(hwnd, None, left, top, w, h, flags);
+                    }
+                }
+                Deferred::OpenMenu {
+                    anchor,
+                    above,
+                    state,
+                    dark,
+                    topmost,
+                } => {
+                    if menu::open(hwnd, anchor, above, state, dark, topmost).is_err() {
+                        menu::tell_owner(hwnd, Action::Closed);
+                    }
                 }
                 Deferred::TitleBarTheme { dark } => {
                     let value = i32::from(dark);
@@ -137,6 +196,15 @@ struct App {
     notice: Option<(String, &'static str, u32)>,
     /// The last End request's result, set by its background thread.
     ended: Arc<Mutex<Option<(String, EndOutcome)>>>,
+    /// Asks the sampler for every app, which is only worth paying for while the
+    /// Apps page is on screen.
+    wants_table: Arc<AtomicBool>,
+    /// How many lines of the Apps table are scrolled off the top.
+    scroll: usize,
+    /// Where the pointer last was, to refresh what it is over after a scroll.
+    pointer: (f32, f32),
+    menu_open: bool,
+    menu_closed: Option<Instant>,
 }
 
 impl App {
@@ -145,15 +213,89 @@ impl App {
         unsafe { GetDpiForWindow(self.hwnd) as f32 / BASE_DPI }
     }
 
+    fn options(&self) -> Options {
+        let (apps, frozen) = self.app_counts();
+        Options {
+            apps,
+            frozen,
+            page: self.settings.page,
+            simple: self.settings.simple,
+            sort: self.settings.sort.key,
+        }
+    }
+
     fn relayout(&mut self, width_px: u32, height_px: u32) {
         let scale = self.scale();
-        let (apps, frozen) = self.app_counts();
         self.layout = layout::compute(
             width_px as f32 / scale,
             height_px as f32 / scale,
-            apps,
-            frozen,
+            self.options(),
         );
+        self.sync_table();
+        self.clamp_scroll();
+    }
+
+    /// Starts or stops the extra work of the Apps page to match what is showing.
+    fn sync_table(&mut self) {
+        let wanted = self.layout.table.is_some();
+        let before = self.wants_table.swap(wanted, Ordering::Relaxed);
+        if wanted && !before {
+            if let Some(sampler) = &self.sampler {
+                sampler.wake();
+            }
+        } else if before && !wanted {
+            self.monitor.table = Vec::new();
+            self.gfx.drop_icons();
+        }
+    }
+
+    fn clamp_scroll(&mut self) {
+        let visible = self.layout.table.as_ref().map_or(0, |t| t.visible);
+        let last = self.monitor.table.len().saturating_sub(visible);
+        self.scroll = self.scroll.min(last);
+    }
+
+    fn set_page(&mut self, page: Page) {
+        if page != self.settings.page {
+            self.settings.page = page;
+            self.scroll = 0;
+            self.confirm = None;
+            self.refresh_layout();
+            self.invalidate();
+        }
+    }
+
+    fn set_sort(&mut self, sort: Sort) {
+        self.settings.sort = sort;
+        self.scroll = 0;
+        let rows = std::mem::take(&mut self.monitor.table);
+        self.monitor.table = apps::arrange(rows, sort, None);
+        self.refresh_layout();
+        self.invalidate();
+    }
+
+    fn click_heading(&mut self, key: SortKey) {
+        let Some(table) = &self.layout.table else {
+            return;
+        };
+        let shown: Vec<SortKey> = table.columns.iter().map(|(key, _)| *key).collect();
+        let allowed = layout::allowed_columns(self.settings.simple);
+        self.set_sort(self.settings.sort.after_click(key, &shown, allowed));
+    }
+
+    /// The order to keep for now, if rows must not move under the pointer.
+    fn held_order(&self) -> Option<Vec<String>> {
+        (self.hover.row.is_some() || self.confirm.is_some())
+            .then(|| self.monitor.table.iter().map(|r| r.key.clone()).collect())
+    }
+
+    fn scroll_table(&mut self, delta: i16) {
+        let lines = (delta as f32 / WHEEL_NOTCH * WHEEL_LINES).round() as isize;
+        self.scroll = self.scroll.saturating_add_signed(-lines);
+        self.clamp_scroll();
+        let (x, y) = self.pointer;
+        self.set_hover(self.hover_at(x, y));
+        self.invalidate();
     }
 
     fn app_counts(&self) -> (usize, bool) {
@@ -188,6 +330,10 @@ impl App {
                 .notice
                 .as_ref()
                 .map(|(key, text, _)| (key.as_str(), *text)),
+            simple: self.settings.simple,
+            sort: self.settings.sort,
+            scroll: self.scroll,
+            menu_open: self.menu_open,
         };
         let _ = self.gfx.draw(|canvas| ui::paint(canvas, &view));
     }
@@ -197,7 +343,13 @@ impl App {
         let snapshot = self.latest.lock().ok().and_then(|mut slot| slot.take());
         let Some(snapshot) = snapshot else { return };
         let before = self.app_counts();
+        let held = self.held_order();
         self.monitor.update(snapshot);
+        if !self.monitor.table.is_empty() {
+            let rows = std::mem::take(&mut self.monitor.table);
+            self.monitor.table = apps::arrange(rows, self.settings.sort, held.as_deref());
+            self.clamp_scroll();
+        }
         if self.app_counts() != before {
             self.refresh_layout();
         }
@@ -224,7 +376,10 @@ impl App {
         }
 
         // SAFETY: the handle is valid for as long as `App` exists.
-        if !unsafe { IsIconic(self.hwnd) }.as_bool() {
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            // Nobody can see the table, so stop paying for it until restored.
+            self.wants_table.store(false, Ordering::Relaxed);
+        } else {
             self.invalidate();
         }
     }
@@ -232,10 +387,11 @@ impl App {
     /// Drops the End question if its app has gone or it has been left too long,
     /// so an old question can't sit waiting for a stray click.
     fn age_app_messages(&mut self) {
-        let apps = &self.monitor.apps;
+        let (apps, table) = (&self.monitor.apps, &self.monitor.table);
         if let Some((key, age)) = &mut self.confirm {
             *age += 1;
-            if *age >= CONFIRM_SAMPLES || !apps.iter().any(|a| a.key == *key) {
+            let running = apps.iter().any(|a| a.key == *key) || table.iter().any(|r| r.key == *key);
+            if *age >= CONFIRM_SAMPLES || !running {
                 self.confirm = None;
             }
         }
@@ -248,11 +404,7 @@ impl App {
     }
 
     /// Ends every process of an app, away from the UI thread.
-    fn end_app(&mut self, index: usize) {
-        let Some(app) = self.monitor.apps.get(index) else {
-            return;
-        };
-        let (key, processes) = (app.key.clone(), app.processes.clone());
+    fn end_app(&mut self, key: String, processes: Vec<ProcessId>) {
         let (result, target) = (self.ended.clone(), self.hwnd.0 as isize);
         std::thread::spawn(move || {
             let outcome = end_app(&processes);
@@ -300,16 +452,72 @@ impl App {
         if asking {
             let (end, keep) = layout::confirm_buttons(row);
             if end.contains(x, y) {
+                let (key, processes) = (app.key.clone(), app.processes.clone());
                 self.confirm = None;
-                self.end_app(index);
+                self.end_app(key, processes);
             } else if keep.contains(x, y) {
                 self.confirm = None;
             }
         } else if app.can_end && layout::end_button(row).contains(x, y) {
             self.confirm = Some((app.key.clone(), 0));
+        } else if self.layout.mode != Mode::Strip {
+            // The rest of the row leads to the full list, in the order that puts
+            // this app at the top. A frozen app is first in any order.
+            let key = if app.frozen {
+                SortKey::Cpu
+            } else {
+                app.biggest
+            };
+            self.settings.sort = Sort {
+                key,
+                descending: true,
+            };
+            self.set_page(Page::Apps);
         }
         self.invalidate();
         true
+    }
+
+    /// Handles a click on the Apps page.
+    fn click_table(&mut self, x: f32, y: f32) {
+        let Some(table) = &self.layout.table else {
+            return;
+        };
+        if let Some(key) = table.header_at(x, y) {
+            self.click_heading(key);
+            return;
+        }
+        let slot = table.row_at(x, y);
+        let target = slot.and_then(|slot| {
+            let row = self.monitor.table.get(slot + self.scroll)?;
+            Some((table.row(slot), row))
+        });
+        let Some((rect, row)) = target else {
+            // Clicking anywhere else is a clear "no".
+            if self.confirm.take().is_some() {
+                self.invalidate();
+            }
+            return;
+        };
+        let asking = self
+            .confirm
+            .as_ref()
+            .is_some_and(|(key, _)| *key == row.key);
+        if asking {
+            let (end, keep) = layout::confirm_buttons(rect);
+            if end.contains(x, y) {
+                let (key, processes) = (row.key.clone(), row.processes.clone());
+                self.confirm = None;
+                self.end_app(key, processes);
+            } else if keep.contains(x, y) {
+                self.confirm = None;
+            }
+        } else if row.can_end && layout::end_button(rect).contains(x, y) {
+            self.confirm = Some((row.key.clone(), 0));
+        } else {
+            self.confirm = None;
+        }
+        self.invalidate();
     }
 
     /// Whether a point is on a button of the busy list, which must get clicks
@@ -379,7 +587,7 @@ impl App {
                 };
             }
         }
-        if self.on_app_control(x, y) {
+        if self.on_app_control(x, y) || self.layout.tab_at(x, y).is_some() {
             return HTCLIENT;
         }
         if self.layout.mode == Mode::Strip || y < TITLE_H {
@@ -411,11 +619,22 @@ impl App {
         unsafe {
             let _ = TrackMouseEvent(&mut track);
         }
-        self.set_hover(Hover {
+        self.pointer = (x, y);
+        self.set_hover(self.hover_at(x, y));
+    }
+
+    fn hover_at(&self, x: f32, y: f32) -> Hover {
+        let table = self.layout.table.as_ref();
+        Hover {
             inside: true,
             button: self.layout.button_at(x, y),
             app: self.layout.app_at(x, y),
-        });
+            tab: self.layout.tab_at(x, y),
+            row: table
+                .and_then(|t| t.row_at(x, y))
+                .map(|slot| slot + self.scroll),
+            heading: table.and_then(|t| t.header_at(x, y)),
+        }
     }
 
     /// Whether the pointer is really gone, rather than crossing between the
@@ -455,7 +674,114 @@ impl App {
                 self.queue_pin();
                 self.invalidate();
             }
+            Button::Menu => self.open_menu(),
         }
+    }
+
+    fn is_maximized(&self) -> bool {
+        // SAFETY: the handle is valid for as long as `App` exists.
+        unsafe { IsZoomed(self.hwnd) }.as_bool()
+    }
+
+    /// The window's size in device-independent pixels.
+    fn current_size(&self) -> (i32, i32) {
+        (
+            self.layout.width.round() as i32,
+            self.layout.height.round() as i32,
+        )
+    }
+
+    fn menu_state(&self) -> MenuState {
+        let here = self.current_size();
+        let maximized = self.is_maximized();
+        let preset = Preset::matching(here).filter(|_| !maximized);
+        let is_yours = preset.is_none() && !maximized;
+        MenuState {
+            preset,
+            yours: if is_yours {
+                Some(here)
+            } else {
+                self.settings.your_size
+            },
+            is_yours,
+            simple: self.settings.simple,
+            strip: self.layout.mode == Mode::Strip,
+        }
+    }
+
+    fn open_menu(&mut self) {
+        let just_closed = self
+            .menu_closed
+            .is_some_and(|closed| closed.elapsed() < MENU_REOPEN_DELAY);
+        let button = self
+            .layout
+            .buttons
+            .iter()
+            .find(|(button, _)| *button == Button::Menu)
+            .map(|(_, rect)| *rect);
+        let Some(button) = button.filter(|_| !self.menu_open && !just_closed) else {
+            return;
+        };
+        let mut window = RECT::default();
+        // SAFETY: the handle and out pointer are valid.
+        if unsafe { GetWindowRect(self.hwnd, &mut window) }.is_err() {
+            return;
+        }
+        let scale = self.scale();
+        let at = |offset: f32| (offset * scale).round() as i32;
+        self.menu_open = true;
+        self.pending.push(Deferred::OpenMenu {
+            anchor: (
+                window.left + at(button.right()),
+                window.top + at(button.bottom()),
+            ),
+            above: window.top + at(button.y),
+            state: self.menu_state(),
+            dark: self.dark,
+            topmost: self.settings.always_on_top,
+        });
+        self.invalidate();
+    }
+
+    fn on_menu(&mut self, action: Action) {
+        match action {
+            Action::Size(preset) => self.resize_to(preset.size()),
+            Action::YourSize => {
+                if let Some(size) = self
+                    .settings
+                    .your_size
+                    .filter(|_| !self.menu_state().is_yours)
+                {
+                    self.resize_to(size);
+                }
+            }
+            Action::OpenApps => {
+                self.set_page(Page::Apps);
+                self.resize_to(Preset::Medium.size());
+            }
+            Action::Simple | Action::Advanced => {
+                self.settings.simple = action == Action::Simple;
+                self.refresh_layout();
+                self.invalidate();
+            }
+            Action::Closed => {
+                self.menu_open = false;
+                self.menu_closed = Some(Instant::now());
+                self.invalidate();
+            }
+        }
+    }
+
+    /// Moves to a size, first remembering one chosen by hand so that the menu can
+    /// offer it again.
+    fn resize_to(&mut self, size: (i32, i32)) {
+        let here = self.current_size();
+        if self.is_maximized() {
+            self.pending.push(Deferred::Show(SW_RESTORE));
+        } else if Preset::matching(here).is_none() {
+            self.settings.your_size = Some(here);
+        }
+        self.pending.push(Deferred::Resize(size));
     }
 
     fn queue_pin(&mut self) {
@@ -467,6 +793,14 @@ impl App {
     fn click(&mut self, x: f32, y: f32) {
         if let Some(button) = self.layout.button_at(x, y) {
             self.press(button);
+            return;
+        }
+        if let Some(page) = self.layout.tab_at(x, y) {
+            self.set_page(page);
+            return;
+        }
+        if self.layout.table.is_some() {
+            self.click_table(x, y);
             return;
         }
         if self.click_app(x, y) {
@@ -482,7 +816,7 @@ impl App {
             }
             return;
         }
-        if metric.spec().limits.is_some() {
+        if self.monitor.get(metric).peak.is_some() {
             self.monitor.reset_peak(metric);
             self.invalidate();
         }
@@ -577,6 +911,11 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
     match message {
         WM_APP_SAMPLE => app.on_sample(),
         WM_APP_ENDED => app.on_ended(),
+        WM_APP_MENU => {
+            if let Some(action) = Action::from_code(wparam.0) {
+                app.on_menu(action);
+            }
+        }
         WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 && app.confirm.is_some() => {
             app.confirm = None;
             app.invalidate();
@@ -649,6 +988,10 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
             app.pointer_moved(x, y, true);
         }
         WM_MOUSELEAVE | WM_NCMOUSELEAVE => app.pointer_left(),
+        WM_MOUSEWHEEL => {
+            app.scroll_table(((wparam.0 >> 16) & 0xffff) as i16);
+            return Some(LRESULT(0));
+        }
         WM_LBUTTONUP => {
             let scale = app.scale();
             app.click(
@@ -759,8 +1102,8 @@ pub fn run() -> Result<()> {
             None => (
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                (DEFAULT_SIZE.0 as f32 * system_scale) as i32,
-                (DEFAULT_SIZE.1 as f32 * system_scale) as i32,
+                (Preset::Medium.size().0 as f32 * system_scale) as i32,
+                (Preset::Medium.size().1 as f32 * system_scale) as i32,
             ),
         };
         let hwnd = CreateWindowExW(
@@ -795,9 +1138,14 @@ pub fn run() -> Result<()> {
         let layout = layout::compute(
             client.right as f32 / scale,
             client.bottom as f32 / scale,
-            0,
-            false,
+            Options {
+                page: settings.page,
+                simple: settings.simple,
+                sort: settings.sort.key,
+                ..Default::default()
+            },
         );
+        let wants_table = Arc::new(AtomicBool::new(layout.table.is_some()));
 
         let app = Box::into_raw(Box::new(App {
             hwnd,
@@ -815,6 +1163,11 @@ pub fn run() -> Result<()> {
             confirm: None,
             notice: None,
             ended: Arc::default(),
+            wants_table: wants_table.clone(),
+            scroll: 0,
+            pointer: (0.0, 0.0),
+            menu_open: false,
+            menu_closed: None,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();
@@ -833,15 +1186,20 @@ pub fn run() -> Result<()> {
         )?;
 
         let target = hwnd.0 as isize;
-        (*app).sampler = Some(Sampler::start(latest, core.clone(), move || {
-            // SAFETY: posting to a window that has gone simply fails.
-            let _ = PostMessageW(
-                Some(HWND(target as *mut _)),
-                WM_APP_SAMPLE,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }));
+        (*app).sampler = Some(Sampler::start(
+            latest,
+            core.clone(),
+            wants_table,
+            move || {
+                // SAFETY: posting to a window that has gone simply fails.
+                let _ = PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_SAMPLE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            },
+        ));
 
         let maximized = (*app).settings.maximized;
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });

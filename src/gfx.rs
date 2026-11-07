@@ -170,6 +170,14 @@ impl Gfx {
         }
     }
 
+    /// Lets go of every icon. The Apps page can hold hundreds of them, and any
+    /// still needed are simply made again.
+    pub fn drop_icons(&mut self) {
+        if let Some(target) = &self.target {
+            target.icons.borrow_mut().clear();
+        }
+    }
+
     fn ensure_target(&mut self) -> Result<()> {
         if self.target.is_some() {
             return Ok(());

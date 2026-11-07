@@ -4,6 +4,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::apps::{Sort, SortKey};
+use crate::layout::Page;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     /// The restored window position in physical pixels: left, top, right, bottom.
@@ -12,6 +15,18 @@ pub struct Settings {
     pub always_on_top: bool,
     /// The user has opted in to reading core temperature, so ask again at launch.
     pub core_temp: bool,
+    /// Show only the numbers, rather than the full detail on each tile.
+    pub simple: bool,
+    pub page: Page,
+    pub sort: Sort,
+    /// The size the user last chose by hand, in device-independent pixels.
+    pub your_size: Option<(i32, i32)>,
+}
+
+/// The file can be edited by hand, so a size is only trusted if it could be real.
+fn usable_size(width: i32, height: i32) -> Option<(i32, i32)> {
+    const SIZES: std::ops::Range<i32> = 1..100_000;
+    (SIZES.contains(&width) && SIZES.contains(&height)).then_some((width, height))
 }
 
 impl Settings {
@@ -61,6 +76,25 @@ impl Settings {
                 "maximized" => settings.maximized = flag,
                 "always_on_top" => settings.always_on_top = flag,
                 "core_temp" => settings.core_temp = flag,
+                "simple" => settings.simple = flag,
+                "page" if value == "apps" => settings.page = Page::Apps,
+                "sort" => {
+                    if let Some((key, direction)) = value.split_once(',') {
+                        if let Some(key) = SortKey::from_id(key) {
+                            settings.sort = Sort {
+                                key,
+                                descending: direction == "down",
+                            };
+                        }
+                    }
+                }
+                "your_size" => {
+                    if let Some((width, height)) = value.split_once(',') {
+                        if let (Ok(width), Ok(height)) = (width.parse(), height.parse()) {
+                            settings.your_size = usable_size(width, height);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -75,6 +109,15 @@ impl Settings {
         text += &format!("maximized={}\n", self.maximized as u8);
         text += &format!("always_on_top={}\n", self.always_on_top as u8);
         text += &format!("core_temp={}\n", self.core_temp as u8);
+        text += &format!("simple={}\n", self.simple as u8);
+        if self.page == Page::Apps {
+            text += "page=apps\n";
+        }
+        let direction = if self.sort.descending { "down" } else { "up" };
+        text += &format!("sort={},{direction}\n", self.sort.key.id());
+        if let Some((width, height)) = self.your_size {
+            text += &format!("your_size={width},{height}\n");
+        }
         text
     }
 }
@@ -90,8 +133,35 @@ mod tests {
             maximized: true,
             always_on_top: true,
             core_temp: true,
+            simple: true,
+            page: Page::Apps,
+            sort: Sort {
+                key: SortKey::VideoMemory,
+                descending: false,
+            },
+            your_size: Some((254, 661)),
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
+    }
+
+    #[test]
+    fn an_unknown_sort_keeps_the_default() {
+        assert_eq!(Settings::parse("sort=nonsense,up\n").sort, Sort::default());
+    }
+
+    #[test]
+    fn a_damaged_size_is_ignored() {
+        assert_eq!(Settings::parse("your_size=254\n").your_size, None);
+        assert_eq!(Settings::parse("your_size=a,b\n").your_size, None);
+        assert_eq!(Settings::parse("your_size=-5,0\n").your_size, None);
+        assert_eq!(Settings::parse("your_size=9999999,10\n").your_size, None);
+    }
+
+    #[test]
+    fn older_files_keep_full_detail_on_the_vitals_page() {
+        let parsed = Settings::parse("always_on_top=1\ncore_temp=1\n");
+        assert!(!parsed.simple);
+        assert_eq!(parsed.page, Page::Vitals);
     }
 
     #[test]

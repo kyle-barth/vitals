@@ -7,6 +7,7 @@ pub mod processes;
 pub mod ryzen;
 pub mod system;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -25,40 +26,54 @@ const POWER_SMOOTHING: f32 = 0.25;
 pub type Latest = Arc<Mutex<Option<Snapshot>>>;
 
 pub struct Sampler {
-    stop: Option<Sender<()>>,
+    /// Sending wakes the thread early, and dropping this stops it.
+    wake: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Sampler {
     /// Starts sampling. `notify` runs after each new snapshot is stored.
-    pub fn start(latest: Latest, core: CoreLink, notify: impl Fn() + Send + 'static) -> Self {
-        let (stop, stopped) = channel();
+    /// `wants_table` asks for every app, which costs more, so it is only set
+    /// while the Apps page is showing.
+    pub fn start(
+        latest: Latest,
+        core: CoreLink,
+        wants_table: Arc<AtomicBool>,
+        notify: impl Fn() + Send + 'static,
+    ) -> Self {
+        let (wake, woken) = channel();
         let thread = thread::spawn(move || {
             let mut sources = Sources::open();
             loop {
                 let started = Instant::now();
-                let snapshot = sources.sample(&core);
+                let snapshot = sources.sample(&core, wants_table.load(Ordering::Relaxed));
                 if let Ok(mut slot) = latest.lock() {
                     *slot = Some(snapshot);
                 }
                 notify();
                 let wait = INTERVAL.saturating_sub(started.elapsed());
-                match stopped.recv_timeout(wait) {
-                    Err(RecvTimeoutError::Timeout) => {}
-                    _ => break,
+                if let Err(RecvTimeoutError::Disconnected) = woken.recv_timeout(wait) {
+                    break;
                 }
             }
         });
         Self {
-            stop: Some(stop),
+            wake: Some(wake),
             thread: Some(thread),
+        }
+    }
+
+    /// Takes the next sample now, so the Apps page fills as soon as it opens.
+    pub fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            let _ = wake.send(());
         }
     }
 }
 
 impl Drop for Sampler {
     fn drop(&mut self) {
-        self.stop.take();
+        self.wake.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -86,7 +101,7 @@ impl Sources {
         }
     }
 
-    fn sample(&mut self, core: &CoreLink) -> Snapshot {
+    fn sample(&mut self, core: &CoreLink, wants_table: bool) -> Snapshot {
         let mut s = Snapshot {
             vram_total_gb: self.vram_total_gb,
             ..Default::default()
@@ -152,7 +167,7 @@ impl Sources {
             .zip(self.vram_total_gb)
             .map_or(0.0, |(used, total)| used / MB_PER_GB / total * 100.0);
         let gpu_busy = crate::apps::gpu_could_be_busy(gpu.load.unwrap_or(0.0), vram_percent);
-        s.apps = self.processes.busy_apps(gpu_busy, capacity);
+        (s.apps, s.table) = self.processes.apps(gpu_busy, capacity, wants_table);
         s
     }
 }
