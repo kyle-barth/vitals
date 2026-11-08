@@ -1,13 +1,13 @@
 # 🩺 Vitals
 
-A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of about 500 KB, with nothing to install.
+A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of about 590 KB, with nothing to install.
 
 <p align="center">
   <img src="docs/images/default.png" width="340" alt="Vitals at its default size: twelve tiles showing temperatures, memory, load and power, each with a live history line">
   <img src="docs/images/busy.png" width="340" alt="Vitals with the Busy list showing: a red row for a frozen app with an End button, and a row for an app using 37% of the CPU">
 </p>
 
-<p align="center"><sub>Screenshots use sample values.</sub></p>
+<p align="center"><sub>Sensor screenshots use sample values.</sub></p>
 
 ## ⬇️ Download
 
@@ -28,7 +28,7 @@ A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of 
 - 🎚️ **Simple or Advanced:** Simple shows just the numbers. Advanced adds peaks, 2-minute averages and history.
 - 📌 **Pin:** keeps the window on top. Position, size and pin state are remembered.
 - 🌗 **Themes:** light and dark, following Windows
-- 🪶 **Light:** about 1% of one CPU thread and 36 MB of memory at the default size
+- 🪶 **Light:** under 1% of one CPU thread and about 37 MB of memory at the default size
 
 <details>
 <summary>🌡️ Temperature limits</summary>
