@@ -5,6 +5,8 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-10
+
 ### Added
 
 - Hotspot gap: on AMD GPUs at 80% load or more, the hotspot tile shows how far
