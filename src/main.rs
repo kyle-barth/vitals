@@ -8,6 +8,7 @@ mod clipboard;
 mod gfx;
 mod helper;
 mod history;
+mod insights;
 mod layout;
 mod menu;
 mod metrics;
@@ -15,6 +16,7 @@ mod sensors;
 mod settings;
 mod severity;
 mod specs;
+mod startup;
 mod ui;
 mod window;
 
@@ -37,11 +39,13 @@ fn restrict_dll_search() {
 fn main() {
     restrict_dll_search();
     let mut arguments = std::env::args().skip(1);
-    if arguments.next().as_deref() == Some(helper::ARG) {
+    let first = arguments.next();
+    if first.as_deref() == Some(helper::ARG) {
         let pipe = arguments.next().unwrap_or_default();
         std::process::exit(helper::run(&pipe));
     }
-    if let Err(error) = window::run() {
+    let at_sign_in = first.as_deref() == Some(startup::ARG);
+    if let Err(error) = window::run(at_sign_in) {
         let text = HSTRING::from(format!("Vitals could not start.\n\n{error}"));
         // SAFETY: both strings are valid for the call.
         unsafe { MessageBoxW(None, &text, w!("Vitals"), MB_OK | MB_ICONERROR) };

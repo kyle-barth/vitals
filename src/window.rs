@@ -2,6 +2,7 @@
 //! behaviour people expect, including Snap, the Win11 snap layout flyout on the
 //! maximize button, rounded corners, shadows and per-monitor DPI scaling.
 
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromRect, MonitorFromWindow, PAINTSTRUCT,
 };
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::Threading::{
@@ -39,12 +41,14 @@ use crate::gfx::Gfx;
 use crate::helper::CoreLink;
 use crate::layout::{self, Button, Layout, Mode, Options, Page, PartShape, Preset, TITLE_H};
 use crate::menu::{self, Action, MenuState, WM_APP_MENU};
-use crate::metrics::{CoreStatus, MetricId, Monitor};
+use crate::metrics::{ALL, CoreStatus, MetricId, Monitor};
 use crate::sensors::processes::{EndOutcome, end_app};
 use crate::sensors::system::{CpuVendor, cpu_vendor};
 use crate::sensors::{Latest, Sampler};
 use crate::settings::Settings;
+use crate::severity::Severity;
 use crate::specs::{PartKind, Specs};
+use crate::startup;
 use crate::ui::{self, DARK, Hover, LIGHT, View};
 
 const CLASS_NAME: PCWSTR = w!("Vitals.Window");
@@ -74,6 +78,8 @@ const WHEEL_NOTCH: f32 = 120.0;
 /// Clicking the menu's button while it is open closes the menu by taking focus.
 /// That click must not then open it again.
 const MENU_REOPEN_DELAY: Duration = Duration::from_millis(300);
+/// The same alert sounds again no sooner than this.
+const ALERT_AGAIN_AFTER: Duration = Duration::from_secs(600);
 /// Narrower than this and the strip could not show all three temperatures.
 const MIN_SIZE: (i32, i32) = (190, 36);
 const EDGE: f32 = 5.0;
@@ -105,6 +111,8 @@ enum Deferred {
     /// Emptying the clipboard sends a message to its last owner, which may be
     /// this window.
     Copy(String),
+    /// One alert sound, and the taskbar button flashing until it's looked at.
+    Alert,
 }
 
 impl Deferred {
@@ -174,6 +182,17 @@ impl Deferred {
                         LPARAM(0),
                     );
                 }
+                Deferred::Alert => {
+                    let _ = MessageBeep(MB_ICONEXCLAMATION);
+                    let flash = FLASHWINFO {
+                        cbSize: size_of::<FLASHWINFO>() as u32,
+                        hwnd,
+                        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                        uCount: 0,
+                        dwTimeout: 0,
+                    };
+                    let _ = FlashWindowEx(&flash);
+                }
                 Deferred::TitleBarTheme { dark } => {
                     let value = i32::from(dark);
                     let _ = DwmSetWindowAttribute(
@@ -236,6 +255,8 @@ struct App {
     /// Whether the last copy worked, while the button is saying so.
     copied: Option<bool>,
     pc_name: Option<String>,
+    /// When each alert last sounded, so one reading can't keep repeating.
+    alerted: HashMap<String, Instant>,
 }
 
 /// Where each part sits when the Specs page has two columns: the GPU side of
@@ -271,7 +292,29 @@ impl App {
             sort: self.settings.sort.key,
             absent: self.monitor.absent,
             parts: self.specs.as_ref().map(shapes).unwrap_or_default(),
+            limits: self.limits_shown(),
         }
+    }
+
+    fn limits_shown(&self) -> bool {
+        self.monitor.gpu_limit.shown().is_some() || self.monitor.cpu_limit.shown().is_some()
+    }
+
+    /// Plays the alert sound for `key`, at most once every 10 minutes each.
+    fn alert(&mut self, key: String) {
+        if !self.settings.sound_on_critical {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .alerted
+            .get(&key)
+            .is_some_and(|at| now.duration_since(*at) < ALERT_AGAIN_AFTER)
+        {
+            return;
+        }
+        self.alerted.insert(key, now);
+        self.pending.push(Deferred::Alert);
     }
 
     fn relayout(&mut self, width_px: u32, height_px: u32) {
@@ -463,15 +506,47 @@ impl App {
     fn on_sample(&mut self) {
         let snapshot = self.latest.lock().ok().and_then(|mut slot| slot.take());
         let Some(snapshot) = snapshot else { return };
-        let before = (self.app_counts(), self.monitor.absent);
+        let before = (self.app_counts(), self.monitor.absent, self.limits_shown());
         let held = self.held_order();
+        let severities: Vec<Severity> = ALL
+            .iter()
+            .map(|&id| self.monitor.get(id).severity)
+            .collect();
+        let frozen_before: Vec<String> = self
+            .monitor
+            .apps
+            .iter()
+            .filter(|a| a.frozen)
+            .map(|a| a.key.clone())
+            .collect();
         self.monitor.update(snapshot);
+
+        // A reading that has just turned Critical, or an app that has just
+        // frozen, is worth a sound when that's switched on.
+        for (i, &id) in ALL.iter().enumerate() {
+            if self.monitor.get(id).severity == Severity::Critical
+                && severities[i] != Severity::Critical
+            {
+                self.alert(format!("{id:?}"));
+            }
+        }
+        let newly_frozen: Vec<String> = self
+            .monitor
+            .apps
+            .iter()
+            .filter(|a| a.frozen && !frozen_before.contains(&a.key))
+            .map(|a| a.key.clone())
+            .collect();
+        for key in newly_frozen {
+            self.alert(format!("frozen {key}"));
+        }
+
         if !self.monitor.table.is_empty() {
             let rows = std::mem::take(&mut self.monitor.table);
             self.monitor.table = apps::arrange(rows, self.settings.sort, held.as_deref());
             self.clamp_scroll();
         }
-        if (self.app_counts(), self.monitor.absent) != before {
+        if (self.app_counts(), self.monitor.absent, self.limits_shown()) != before {
             self.refresh_layout();
         }
         self.age_app_messages();
@@ -832,6 +907,8 @@ impl App {
             is_yours,
             simple: self.settings.simple,
             strip: self.layout.mode == Mode::Strip,
+            start_with_windows: startup::is_enabled(),
+            sound_on_critical: self.settings.sound_on_critical,
         }
     }
 
@@ -889,6 +966,12 @@ impl App {
                 self.settings.simple = action == Action::Simple;
                 self.refresh_layout();
                 self.invalidate();
+            }
+            Action::StartWithWindows => {
+                startup::set(!startup::is_enabled());
+            }
+            Action::SoundOnCritical => {
+                self.settings.sound_on_critical = !self.settings.sound_on_critical;
             }
             Action::Closed => {
                 self.menu_open = false;
@@ -1209,7 +1292,8 @@ fn saved_rect(settings: &Settings) -> Option<RECT> {
     (sized && on_screen).then_some(rect)
 }
 
-pub fn run() -> Result<()> {
+/// `at_sign_in` is set when Windows starts Vitals as you sign in.
+pub fn run(at_sign_in: bool) -> Result<()> {
     // SAFETY: the mutex is held for the life of the process, so only one
     // window is ever running.
     let _instance: HANDLE = unsafe { CreateMutexW(None, true, INSTANCE_MUTEX)? };
@@ -1219,6 +1303,7 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     request_efficiency_mode();
+    startup::follow_moved_exe();
 
     let settings = Settings::load();
     // SAFETY: the window class and creation parameters are valid, and the
@@ -1316,6 +1401,7 @@ pub fn run() -> Result<()> {
             specs_read: Arc::default(),
             copied: None,
             pc_name: std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()),
+            alerted: HashMap::new(),
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();
@@ -1352,7 +1438,8 @@ pub fn run() -> Result<()> {
         let maximized = (*app).settings.maximized;
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         // The helper reads AMD's library, so there is nothing for it to do on Intel.
-        if (*app).settings.core_temp && cpu_vendor() != CpuVendor::Intel {
+        // At sign-in it waits for a click, so a login never opens on a UAC prompt.
+        if (*app).settings.core_temp && cpu_vendor() != CpuVendor::Intel && !at_sign_in {
             core.start(hwnd.0 as isize);
         }
 

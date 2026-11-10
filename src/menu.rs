@@ -49,12 +49,14 @@ pub enum Action {
     OpenApps,
     Simple,
     Advanced,
+    StartWithWindows,
+    SoundOnCritical,
     /// The menu has gone.
     Closed,
 }
 
 impl Action {
-    const ALL: [Action; 8] = [
+    const ALL: [Action; 10] = [
         Action::Size(Preset::Small),
         Action::Size(Preset::Medium),
         Action::Size(Preset::Large),
@@ -63,7 +65,14 @@ impl Action {
         Action::Simple,
         Action::Advanced,
         Action::Closed,
+        Action::StartWithWindows,
+        Action::SoundOnCritical,
     ];
+
+    /// Ticks that switch something on or off, rather than choosing between options.
+    pub fn is_tick(self) -> bool {
+        matches!(self, Action::StartWithWindows | Action::SoundOnCritical)
+    }
 
     fn code(self) -> usize {
         Self::ALL.iter().position(|a| *a == self).unwrap_or(0)
@@ -85,6 +94,8 @@ pub struct MenuState {
     pub simple: bool,
     /// A strip has no tabs, so the menu offers the way to Apps.
     pub strip: bool,
+    pub start_with_windows: bool,
+    pub sound_on_critical: bool,
 }
 
 /// One row of the menu, or one half of the Simple and Advanced switch.
@@ -108,6 +119,8 @@ pub struct Plan {
     pub show_heading_y: f32,
     pub rule_y: f32,
     pub switch: Rect,
+    /// The line above the ticks.
+    pub ticks_rule_y: f32,
     pub items: Vec<Item>,
 }
 
@@ -186,13 +199,38 @@ impl Plan {
                 ticked,
             });
         }
+        let ticks_rule_y = switch.bottom() + RULE_H / 2.0;
+        let mut y = switch.bottom() + RULE_H;
+        for (action, label, ticked) in [
+            (
+                Action::StartWithWindows,
+                "Start with Windows",
+                state.start_with_windows,
+            ),
+            (
+                Action::SoundOnCritical,
+                "Sound on Critical",
+                state.sound_on_critical,
+            ),
+        ] {
+            items.push(Item {
+                action,
+                rect: Rect::new(INSET, y, inner, ROW_H),
+                label,
+                detail: String::new(),
+                glyph: None,
+                ticked,
+            });
+            y += ROW_H;
+        }
         Self {
             width: WIDTH,
-            height: switch.bottom() + INSET,
+            height: y + INSET,
             size_heading_y,
             show_heading_y,
             rule_y,
             switch,
+            ticks_rule_y,
             items,
         }
     }
@@ -267,8 +305,19 @@ impl Menu {
         tell_owner(self.owner, action);
         match action {
             // Staying open means the difference can be seen before moving on.
-            Action::Simple | Action::Advanced => {
-                self.state.simple = action == Action::Simple;
+            Action::Simple
+            | Action::Advanced
+            | Action::StartWithWindows
+            | Action::SoundOnCritical => {
+                match action {
+                    Action::Simple | Action::Advanced => {
+                        self.state.simple = action == Action::Simple;
+                    }
+                    Action::StartWithWindows => {
+                        self.state.start_with_windows = !self.state.start_with_windows;
+                    }
+                    _ => self.state.sound_on_critical = !self.state.sound_on_critical,
+                }
                 self.plan = Plan::new(&self.state);
                 // SAFETY: the handle is this window's own.
                 unsafe {
@@ -480,6 +529,8 @@ mod tests {
             is_yours: false,
             simple: false,
             strip: false,
+            start_with_windows: false,
+            sound_on_critical: false,
         }
     }
 
@@ -505,8 +556,22 @@ mod tests {
                 Action::Size(Preset::Large),
                 Action::Simple,
                 Action::Advanced,
+                Action::StartWithWindows,
+                Action::SoundOnCritical,
             ]
         );
+    }
+
+    #[test]
+    fn each_tick_shows_its_own_setting() {
+        let plan = Plan::new(&MenuState {
+            start_with_windows: true,
+            sound_on_critical: false,
+            ..state()
+        });
+        let ticked = |action| plan.items.iter().any(|i| i.action == action && i.ticked);
+        assert!(ticked(Action::StartWithWindows));
+        assert!(!ticked(Action::SoundOnCritical));
     }
 
     #[test]

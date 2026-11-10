@@ -26,6 +26,7 @@ mod sensor {
     pub const TEMP_EDGE: usize = 8;
     pub const TEMP_MEMORY: usize = 9;
     pub const FAN_RPM: usize = 14;
+    pub const FAN_PERCENT: usize = 15;
     pub const ACTIVITY_GFX: usize = 19;
     pub const ASIC_POWER: usize = 23;
     pub const TEMP_HOTSPOT: usize = 27;
@@ -214,6 +215,7 @@ impl Adl {
             load: log.get(sensor::ACTIVITY_GFX),
             power_w: log.get(sensor::BOARD_POWER).or(log.get(sensor::ASIC_POWER)),
             fan_rpm: log.get(sensor::FAN_RPM),
+            fan_percent: log.get(sensor::FAN_PERCENT),
             vram_used_mb,
             ..GpuReading::default()
         }

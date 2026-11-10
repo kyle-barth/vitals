@@ -2,6 +2,7 @@
 
 use crate::apps::{AppRow, BusyApp};
 use crate::history::Series;
+use crate::insights::{GapTracker, LimitTracker, cpu_clear, cpu_limit, gpu_clear, gpu_limit};
 use crate::severity::{Limits, Severity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -203,7 +204,7 @@ impl MetricId {
         }
     }
 
-    /// The short name used in the title bar when this metric raises an alert.
+    /// The short name used on the taskbar when this metric raises an alert.
     pub fn alert_name(self) -> &'static str {
         match self {
             MetricId::CpuTemp => "CPU",
@@ -227,6 +228,10 @@ pub struct Snapshot {
     pub absent: Absent,
     pub apps: Vec<BusyApp>,
     pub table: Vec<AppRow>,
+    /// The CPU's package power limit, from the core temperature helper.
+    pub cpu_power_limit: Option<f32>,
+    /// NVIDIA's bit mask of why the GPU's clocks are held down.
+    pub gpu_limit_reasons: Option<u64>,
 }
 
 impl Default for Snapshot {
@@ -240,6 +245,8 @@ impl Default for Snapshot {
             absent: Absent::default(),
             apps: Vec::new(),
             table: Vec::new(),
+            cpu_power_limit: None,
+            gpu_limit_reasons: None,
         }
     }
 }
@@ -287,6 +294,11 @@ pub struct Monitor {
     pub apps: Vec<BusyApp>,
     /// Every app, while the Apps view is open.
     pub table: Vec<AppRow>,
+    /// How far the GPU's hotspot runs above its edge.
+    pub gap: GapTracker,
+    pub gpu_limit: LimitTracker,
+    pub cpu_limit: LimitTracker,
+    pub cpu_power_limit: Option<f32>,
 }
 
 impl Monitor {
@@ -317,6 +329,49 @@ impl Monitor {
         self.absent = snapshot.absent;
         self.apps = snapshot.apps;
         self.table = snapshot.table;
+        self.cpu_power_limit = snapshot.cpu_power_limit;
+
+        let value = |id: MetricId| self.readings[id as usize].value;
+        let critical = |id: MetricId| id.spec().limits.map(|l| l.critical);
+        self.gap.update(
+            value(MetricId::GpuTemp),
+            value(MetricId::GpuHotspot),
+            value(MetricId::GpuLoad),
+        );
+        let gpu = gpu_limit(
+            value(MetricId::GpuHotspot),
+            critical(MetricId::GpuHotspot),
+            snapshot.gpu_limit_reasons,
+        );
+        let cpu = cpu_limit(
+            value(MetricId::CpuTemp),
+            critical(MetricId::CpuTemp),
+            value(MetricId::CpuPower),
+            self.cpu_power_limit,
+        );
+        self.gpu_limit.update(gpu);
+        self.cpu_limit.update(cpu);
+        if let (None, Some(kind)) = (gpu, self.gpu_limit.shown()) {
+            if gpu_clear(
+                kind,
+                value(MetricId::GpuHotspot),
+                critical(MetricId::GpuHotspot),
+                value(MetricId::GpuLoad),
+            ) {
+                self.gpu_limit.release();
+            }
+        }
+        if let (None, Some(kind)) = (cpu, self.cpu_limit.shown()) {
+            if cpu_clear(
+                kind,
+                value(MetricId::CpuTemp),
+                critical(MetricId::CpuTemp),
+                value(MetricId::CpuPower),
+                self.cpu_power_limit,
+            ) {
+                self.cpu_limit.release();
+            }
+        }
     }
 
     pub fn reset_peak(&mut self, id: MetricId) {
@@ -334,7 +389,7 @@ impl Monitor {
         }
     }
 
-    /// The most severe temperature, if it needs to interrupt the title bar:
+    /// The most severe temperature, if it needs to reach the taskbar:
     /// anything critical, or anything hot that is not currently on screen.
     pub fn alert(
         &self,

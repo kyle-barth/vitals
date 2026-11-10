@@ -5,6 +5,28 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+### Added
+
+- Hotspot gap: on AMD GPUs at 80% load or more, the hotspot tile shows how far
+  it runs above the edge temperature. Once the gap holds at 30° or more for a
+  minute at 90% load, the tile says Wide gap, and a large window shades the
+  band between the two lines.
+- At limit: a tile says when the GPU or CPU has been held at its temperature
+  or power limit for 5 seconds, and for how much of the last 2 minutes. A
+  large window adds a Limits row. The CPU's limits need the core temperature
+  helper, and NVIDIA cards report their own reasons.
+- Start with Windows, in the menu. It respects the switch in Task Manager's
+  Startup apps, and doesn't start the core temperature helper at sign-in, so
+  signing in never opens on a UAC prompt.
+- Sound on Critical, in the menu and off by default: the Windows warning sound
+  and a flash of the taskbar button when a reading turns Critical or an app
+  stops responding, at most once every 10 minutes for each.
+
+### Changed
+
+- A warning no longer takes over the top of the window, so the tabs always
+  show, even at the Medium size. It still reaches the taskbar.
+
 ## [0.4.0] - 2026-11-07
 
 ### Added

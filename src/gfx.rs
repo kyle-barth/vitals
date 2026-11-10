@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
-    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
+    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
+    D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND,
@@ -392,6 +393,33 @@ impl Canvas<'_> {
                 &self.gfx.round,
             );
         }
+    }
+
+    /// Fills a closed shape through `points`.
+    pub fn fill_polygon(&self, points: &[(f32, f32)], color: Color) {
+        let Some(((x, y), rest)) = points.split_first().map(|(a, b)| (*a, b)) else {
+            return;
+        };
+        if rest.len() < 2 {
+            return;
+        }
+        let rest: Vec<Vector2> = rest.iter().map(|&(x, y)| Vector2 { X: x, Y: y }).collect();
+        // SAFETY: the geometry and sink are local COM objects, and the sink is
+        // closed before the geometry is drawn.
+        let _ = unsafe {
+            (|| -> Result<()> {
+                let geometry = self.gfx.factory.CreatePathGeometry()?;
+                let sink = geometry.Open()?;
+                sink.BeginFigure(Vector2 { X: x, Y: y }, D2D1_FIGURE_BEGIN_FILLED);
+                sink.AddLines(&rest);
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                self.target
+                    .render
+                    .FillGeometry(&geometry, self.brush(color), None);
+                Ok(())
+            })()
+        };
     }
 
     /// Draws a connected line with round joins and caps.

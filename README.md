@@ -1,6 +1,6 @@
 # 🩺 Vitals
 
-A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of about 590 KB, with nothing to install.
+A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of about 600 KB, with nothing to install.
 
 <p align="center">
   <img src="docs/images/default.png" width="340" alt="Vitals at its default size: twelve tiles showing temperatures, memory, load and power, each with a live history line">
@@ -21,12 +21,14 @@ A tiny, fully resizable sensor monitor for Windows, written in Rust. One exe of 
 
 - 🌡️ **Temperatures:** CPU, GPU, hotspot and VRAM, each with a session peak. Click a tile to reset its peak.
 - 📈 **Live stats:** load, power, memory, disk, network and fan speed, with history lines
-- 🚦 **Warnings:** Warm adds a label, Hot tints the tile and Critical turns it red. Serious ones also reach the title bar and taskbar, so you can see them while a game covers the window.
+- 🚦 **Warnings:** Warm adds a label, Hot tints the tile and Critical turns it red. Serious ones also reach the taskbar, so you can see them while a game covers the window.
+- 🎮 **While you play:** the hotspot tile shows how far it runs above the GPU's edge, and a tile says **At limit** when a part is held at its temperature or power limit
 - 🔥 **Busy apps:** only shown when an app is using a lot, with End and a "not responding" warning
 - 📋 **Apps view:** every app in a sortable table, like Task Manager
 - 🧾 **Specs:** what's in the PC, from CPU to Windows version, with one click to copy it as text
 - 🎚️ **Simple or Advanced:** Simple shows just the numbers. Advanced adds peaks, 2-minute averages and history.
 - 📌 **Pin:** keeps the window on top. Position, size and pin state are remembered.
+- 🚀 **Start with Windows** and 🔔 **Sound on Critical:** two ticks in the menu beside the pin
 - 🌗 **Themes:** light and dark, following Windows
 - 🪶 **Light:** under 1% of one CPU thread and about 37 MB of memory at the default size
 
@@ -69,6 +71,32 @@ A warning clears once the value is 3° below its limit, so it doesn't flicker. L
 <p align="center">
   <img src="docs/images/strip.png" width="320" alt="Vitals as a slim strip, showing CPU, GPU and hotspot temperatures with RAM and VRAM use on one line">
 </p>
+
+## 🎮 While you play
+
+<p align="center">
+  <img src="docs/images/game.png" width="340" alt="Vitals during a demanding game: the GPU hotspot tile is red and says At limit, with Wide gap +32° beside 110°, and the CPU power tile says At limit, 159 W of a 162 W limit">
+</p>
+
+- 🌡️ **Hotspot gap:** on AMD GPUs at 80% load or more, the hotspot tile shows how far it runs above the edge temperature. Healthy cards often run 15–25° apart.
+- ↔️ **Wide gap** appears once the gap holds at 30° or more for a minute at 90% load, and clears below 27°. A large window also shades the band between the two lines. A gap that stays wide tends to point at the cooler's contact with the chip, rather than at the game.
+- 🧱 **At limit** replaces a tile's warning once a part has held its limit for 5 seconds, and says how much of the last 2 minutes it spent there:
+  - 🎮 **GPU:** a hotspot at 110°, or the reason an NVIDIA card gives for holding its clocks down
+  - 🧮 **CPU:** cores at 95°, or at 97% of their power limit. Both need the core temperature helper.
+  - 🎨 Temperature limits stay red. A power limit is grey, because a part at full load is meant to reach it.
+- 📋 **Limits row:** a large window lists each part at a limit along the bottom, such as `GPU hotspot 110° (limit) · fans 100% · 74% of last 2 min`
+- ➖ **Strip:** ▾ marks a reading at its limit, and the gap joins the hotspot while it's wide
+- 🪟 **Nothing here moves or resizes the window**
+
+![Vitals at a large size during a game: the hotspot tile shades the gap between hotspot and edge, and a Limits row along the bottom lists the GPU hotspot and CPU power at their limits](docs/images/game-large.png)
+
+## ⚙️ Menu ticks
+
+The menu beside the pin also has two ticks:
+
+- 🚀 **Start with Windows** adds one value to your own Run key. Nothing is installed, and unticking removes it. If you switch Vitals off in Task Manager's Startup apps, the tick follows, and only ticking it again turns it back on.
+- 🔐 **At sign-in** Vitals doesn't start the core temperature helper, so signing in never opens on a UAC prompt. Click the CPU tile when you want the core reading.
+- 🔔 **Sound on Critical** is off by default. It plays the Windows warning sound and flashes the taskbar button when a reading turns Critical or an app stops responding, at most once every 10 minutes for each.
 
 ## 🔥 Busy apps
 
@@ -132,7 +160,7 @@ Windows has no standard API for this. On Intel CPUs it can only be read through 
 
 - 🟡 **Without admin rights:** the tile shows the I/O die, labelled "CPU I/O die". This is not a core temperature.
 - 🟢 **Click that tile** for the true core temperature, labelled "CPU temp". This starts a small helper with admin rights. Windows normally shows a UAC prompt, but if prompts are turned off it happens silently, so the click is the only consent.
-- 🔁 **It repeats at each launch** until a prompt is declined. To stop it, set `core_temp=0` in `%APPDATA%\Vitals\settings.ini`.
+- 🔁 **It repeats at each launch** until a prompt is declined. To stop it, set `core_temp=0` in `%APPDATA%\Vitals\settings.ini`. When Windows starts Vitals at sign-in, it waits for a click instead.
 - ⚠️ **It relies on an undocumented AMD export** in `Platform.dll`, worked out on a 9800X3D, so an AMD Software update could change it. Every field is range-checked, so the tile would stay on the I/O die rather than show a wrong number.
 
 ## 🔒 Security

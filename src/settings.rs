@@ -21,6 +21,8 @@ pub struct Settings {
     pub sort: Sort,
     /// The size the user last chose by hand, in device-independent pixels.
     pub your_size: Option<(i32, i32)>,
+    /// Play a sound when a reading turns Critical.
+    pub sound_on_critical: bool,
 }
 
 /// The file can be edited by hand, so a size is only trusted if it could be real.
@@ -77,6 +79,7 @@ impl Settings {
                 "always_on_top" => settings.always_on_top = flag,
                 "core_temp" => settings.core_temp = flag,
                 "simple" => settings.simple = flag,
+                "sound_on_critical" => settings.sound_on_critical = flag,
                 "page" if value == "apps" => settings.page = Page::Apps,
                 "page" if value == "specs" => settings.page = Page::Specs,
                 "sort" => {
@@ -111,6 +114,7 @@ impl Settings {
         text += &format!("always_on_top={}\n", self.always_on_top as u8);
         text += &format!("core_temp={}\n", self.core_temp as u8);
         text += &format!("simple={}\n", self.simple as u8);
+        text += &format!("sound_on_critical={}\n", self.sound_on_critical as u8);
         match self.page {
             Page::Apps => text += "page=apps\n",
             Page::Specs => text += "page=specs\n",
@@ -143,6 +147,7 @@ mod tests {
                 descending: false,
             },
             your_size: Some((254, 661)),
+            sound_on_critical: true,
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
     }

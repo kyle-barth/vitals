@@ -44,7 +44,7 @@ use crate::sensors::ryzen::{CoreReading, RyzenMaster};
 pub const ARG: &str = "--cpu-helper";
 
 const PIPE_PREFIX: &str = r"\\.\pipe\vitals-";
-const RECORD_LEN: usize = size_of::<f32>() * 2;
+const RECORD_LEN: usize = size_of::<f32>() * 3;
 const EXIT_OK: i32 = 0;
 const EXIT_BAD_ARGUMENT: i32 = 2;
 const EXIT_UNSUPPORTED: i32 = 3;
@@ -115,14 +115,16 @@ pub fn run(pipe_name: &str) -> i32 {
 fn encode(r: CoreReading) -> [u8; RECORD_LEN] {
     let mut bytes = [0u8; RECORD_LEN];
     bytes[..4].copy_from_slice(&r.temp_c.to_le_bytes());
-    bytes[4..].copy_from_slice(&r.package_w.to_le_bytes());
+    bytes[4..8].copy_from_slice(&r.package_w.to_le_bytes());
+    bytes[8..].copy_from_slice(&r.limit_w.to_le_bytes());
     bytes
 }
 
 fn decode(bytes: &[u8; RECORD_LEN]) -> CoreReading {
     CoreReading {
         temp_c: f32::from_le_bytes(bytes[..4].try_into().unwrap()),
-        package_w: f32::from_le_bytes(bytes[4..].try_into().unwrap()),
+        package_w: f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        limit_w: f32::from_le_bytes(bytes[8..].try_into().unwrap()),
     }
 }
 
@@ -317,6 +319,7 @@ mod tests {
         let reading = CoreReading {
             temp_c: 88.5,
             package_w: 101.25,
+            limit_w: 162.0,
         };
         assert_eq!(decode(&encode(reading)), reading);
     }

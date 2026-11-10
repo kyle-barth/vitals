@@ -10,10 +10,10 @@ use std::sync::Arc;
 use crate::apps::{AppRow, BusyApp, Icon, Sort, SortKey};
 use crate::gfx::{Align, Canvas, Color, Weight};
 use crate::history::{CAPACITY, Series};
+use crate::insights::LimitKind;
 use crate::layout::{
     Button, Cell, Layout, Mode, PAD, Page, Rect, SPECS_FACT_H, SPECS_ITEM_H, SPECS_LABEL_W,
-    SpecsPage, StripItem, StripPlan, TABLE_ROW_PAD, TITLE_H, Table, confirm_buttons, end_button,
-    plan_strip,
+    SpecsPage, StripItem, StripPlan, TABLE_ROW_PAD, Table, confirm_buttons, end_button, plan_strip,
 };
 use crate::menu::{Action, Plan};
 use crate::metrics::{CoreStatus, MetricId, Monitor, Scale, Unit};
@@ -167,7 +167,8 @@ pub fn is_visible(layout: &Layout, monitor: &Monitor, metric: MetricId) -> bool 
         .any(|c| resolve(c.metric, monitor) == metric)
 }
 
-/// The text for the title bar and taskbar when a temperature needs attention.
+/// The text for the taskbar, through the window's title, when a temperature
+/// needs attention.
 pub fn alert_text(layout: &Layout, monitor: &Monitor) -> Option<String> {
     let (metric, _, value) = monitor.alert(|m| is_visible(layout, monitor, m))?;
     Some(format!("{} {:.0}°", metric.alert_name(), value))
@@ -197,7 +198,198 @@ pub fn paint(c: &Canvas, v: &View) {
     if let Some(area) = v.layout.threads {
         paint_threads(c, v, area);
     }
+    if let Some(area) = v.layout.limits {
+        paint_limits(c, v, area);
+    }
     paint_app_rows(c, v, false);
+}
+
+/// The limit a tile's own reading is at, if it's being shown.
+fn limit_on(metric: MetricId, monitor: &Monitor) -> Option<LimitKind> {
+    let (gpu, cpu) = (monitor.gpu_limit.shown(), monitor.cpu_limit.shown());
+    let temperature = Some(LimitKind::Temperature);
+    let power = Some(LimitKind::Power);
+    match metric {
+        MetricId::GpuHotspot if gpu == temperature => gpu,
+        // A GPU without a hotspot sensor shows its limit on the edge instead.
+        MetricId::GpuTemp
+            if gpu == temperature && monitor.absent.contains(MetricId::GpuHotspot) =>
+        {
+            gpu
+        }
+        MetricId::CpuTemp if cpu == temperature => cpu,
+        MetricId::GpuPower if gpu == power => gpu,
+        MetricId::CpuPower if cpu == power => cpu,
+        _ => None,
+    }
+}
+
+/// The word beside a tile's label, with the color of its dot: the limit it is
+/// at, or its severity. A power limit is normal under full load, so it stays grey.
+fn chip(metric: MetricId, v: &View, severity: Severity) -> Option<(&'static str, Color)> {
+    match limit_on(metric, v.monitor) {
+        Some(LimitKind::Temperature) => {
+            Some(("At limit", status_color(severity.max(Severity::Hot))))
+        }
+        Some(LimitKind::Power) => Some(("At limit", v.theme.ink3)),
+        None => (severity != Severity::Normal).then(|| (severity.label(), status_color(severity))),
+    }
+}
+
+/// Short facts for the row beside a tile's number, most telling first.
+fn details(metric: MetricId, v: &View) -> Vec<String> {
+    let monitor = v.monitor;
+    let mut out = Vec::new();
+    if metric == MetricId::GpuHotspot {
+        if let Some(gap) = monitor.gap.view() {
+            out.push(if gap.wide {
+                format!("Wide gap +{:.0}°", gap.degrees)
+            } else {
+                format!("+{:.0}° over edge", gap.degrees)
+            });
+        }
+    }
+    // Read on from the number: "159 W  of 162 W limit".
+    if metric == MetricId::CpuPower {
+        if let Some(limit) = monitor.cpu_power_limit {
+            out.push(format!("of {limit:.0} W limit"));
+        }
+    }
+    if limit_on(metric, monitor).is_some() {
+        let tracker = if matches!(metric, MetricId::CpuTemp | MetricId::CpuPower) {
+            &monitor.cpu_limit
+        } else {
+            &monitor.gpu_limit
+        };
+        out.push(format!("{:.0}% of last 2 min", tracker.share()));
+    }
+    if let Some(average) = average_text(metric, monitor) {
+        out.push(average);
+    }
+    out
+}
+
+const SEPARATOR: &str = "  ·  ";
+
+/// Joins as many of `parts` as fit in `room`, in order.
+fn fit_parts(c: &Canvas, parts: &[String], room: f32) -> Option<String> {
+    let mut text: Option<String> = None;
+    for part in parts {
+        let next = match &text {
+            Some(t) => format!("{t}{SEPARATOR}{part}"),
+            None => part.clone(),
+        };
+        if c.measure(&next, 11.0, Weight::Regular) > room {
+            break;
+        }
+        text = Some(next);
+    }
+    text
+}
+
+/// Runs of text drawn one after another: (text, weight, color).
+fn paint_runs(c: &Canvas, runs: &[(String, Weight, Color)], (x, y): (f32, f32), size: f32) -> f32 {
+    let mut at = x;
+    for (text, weight, color) in runs {
+        at += c.text_mid(text, (at, y), size, *weight, Align::Left, *color);
+    }
+    at - x
+}
+
+/// What each part's limit row says.
+fn limit_runs(v: &View) -> Vec<Vec<(String, Weight, Color)>> {
+    let m = v.monitor;
+    let (ink, ink2) = (v.theme.ink, v.theme.ink2);
+    let marker = |kind: LimitKind| {
+        let color = if kind == LimitKind::Temperature {
+            HOT
+        } else {
+            ink2
+        };
+        (" (limit)".to_string(), Weight::Semibold, color)
+    };
+    let share = |share: f32| {
+        (
+            format!(" · {share:.0}% of last 2 min"),
+            Weight::Regular,
+            ink2,
+        )
+    };
+    let value = |id: MetricId| m.get(id).value;
+    let mut out = Vec::new();
+    if let Some(kind) = m.gpu_limit.shown() {
+        let mut runs = vec![("GPU  ".to_string(), Weight::Semibold, ink)];
+        match kind {
+            LimitKind::Temperature => {
+                let (name, temp) = match value(MetricId::GpuHotspot) {
+                    Some(hot) => ("hotspot ", Some(hot)),
+                    None => ("", value(MetricId::GpuTemp)),
+                };
+                runs.push((
+                    format!("{name}{}", temp.map_or("–".into(), |t| format!("{t:.0}°"))),
+                    Weight::Regular,
+                    ink,
+                ));
+                runs.push(marker(kind));
+                if value(MetricId::GpuFanPercent).is_some_and(|f| f >= 99.5) {
+                    runs.push((" · fans 100%".into(), Weight::Regular, ink2));
+                }
+            }
+            LimitKind::Power => {
+                let power = value(MetricId::GpuPower).map_or("–".into(), |p| format!("{p:.0} W"));
+                runs.push((format!("power {power}"), Weight::Regular, ink));
+                runs.push(marker(kind));
+            }
+        }
+        runs.push(share(m.gpu_limit.share()));
+        out.push(runs);
+    }
+    if let Some(kind) = m.cpu_limit.shown() {
+        let mut runs = vec![("CPU  ".to_string(), Weight::Semibold, ink)];
+        let power = value(MetricId::CpuPower)
+            .zip(m.cpu_power_limit)
+            .map(|(p, l)| format!("{p:.0} of {l:.0} W"));
+        match kind {
+            LimitKind::Temperature => {
+                let temp = value(MetricId::CpuTemp).map_or("–".into(), |t| format!("{t:.0}°"));
+                runs.push((temp, Weight::Regular, ink));
+                runs.push(marker(kind));
+                if let Some(power) = power {
+                    runs.push((format!(" · {power}"), Weight::Regular, ink2));
+                }
+            }
+            LimitKind::Power => {
+                runs.push((
+                    format!("power {}", power.unwrap_or_else(|| "–".into())),
+                    Weight::Regular,
+                    ink,
+                ));
+                runs.push(marker(kind));
+            }
+        }
+        runs.push(share(m.cpu_limit.share()));
+        out.push(runs);
+    }
+    out
+}
+
+/// The row across a large window that says which parts are at a limit.
+fn paint_limits(c: &Canvas, v: &View, r: Rect) {
+    c.fill_round(r, TILE_RADIUS, v.theme.raised);
+    let y = r.y + r.h / 2.0;
+    let mut x = r.x + INSET;
+    x += c.text_mid(
+        "Limits",
+        (x, y),
+        12.0,
+        Weight::Regular,
+        Align::Left,
+        v.theme.ink2,
+    );
+    for runs in limit_runs(v) {
+        x += 22.0;
+        x += paint_runs(c, &runs, (x, y), 12.0);
+    }
 }
 
 fn paint_app_rows(c: &Canvas, v: &View, flat: bool) {
@@ -428,9 +620,6 @@ fn paint_confirm(c: &Canvas, name: &str, r: Rect) {
     paint_control(c, keep, "Keep", WHITE.with_alpha(0.22), WHITE);
 }
 
-const ALERT_GAP: f32 = 8.0;
-const ALERT_DOT_SPACE: f32 = 16.0;
-
 fn paint_tabs(c: &Canvas, v: &View) {
     for &(page, r) in &v.layout.tabs {
         let label = match page {
@@ -456,49 +645,10 @@ fn paint_tabs(c: &Canvas, v: &View) {
     }
 }
 
+/// The tabs and window buttons. A warning goes to the taskbar instead, through
+/// the window's title, and the tiles already show it, so the tabs always stay.
 fn paint_title_bar(c: &Canvas, v: &View) {
-    let y = TITLE_H / 2.0;
-    let tabs_end = v.layout.tabs.last().map_or(0.0, |(_, r)| r.right());
-    let buttons_start = v
-        .layout
-        .buttons
-        .iter()
-        .fold(v.layout.width, |x, (_, r)| x.min(r.x));
-    match alert_text(v.layout, v.monitor) {
-        Some(alert) => {
-            // An alert sits beside the tabs when it can. Otherwise it takes their
-            // place, because it matters more and they still answer to clicks.
-            let room = buttons_start - tabs_end - ALERT_GAP;
-            let width = ALERT_DOT_SPACE + c.measure(&alert, 12.0, Weight::Semibold);
-            let beside = width <= room;
-            let x = if beside {
-                paint_tabs(c, v);
-                tabs_end + ALERT_GAP
-            } else {
-                PAD
-            };
-            let severity = v.monitor.worst_severity();
-            c.circle(
-                x + 6.0,
-                y,
-                4.0,
-                if severity == Severity::Critical {
-                    CRITICAL
-                } else {
-                    HOT
-                },
-            );
-            c.text_mid(
-                &alert,
-                (x + ALERT_DOT_SPACE, y),
-                12.0,
-                Weight::Semibold,
-                Align::Left,
-                v.theme.ink,
-            );
-        }
-        None => paint_tabs(c, v),
-    }
+    paint_tabs(c, v);
     for &(button, rect) in &v.layout.buttons {
         paint_button(c, v, button, rect);
     }
@@ -621,18 +771,20 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
     );
 
     // A narrow tile cannot hold the label and the chip on one row. The dot then
-    // stays on the title row, and the severity word takes the note's place, so
+    // stays on the title row, and the chip's word takes the note's place, so
     // the status is still spelled out rather than shown by color alone.
     let label_w = c.measure(spec.label, 12.0, Weight::Regular);
-    let chip_w = chip_width(c, reading.severity);
+    let chip = chip(metric, v, reading.severity);
+    let chip_w = chip_width(c, chip);
     let chip_fits = chip_w == 0.0 || left + label_w + 10.0 + chip_w <= right;
     if chip_fits {
-        paint_chip(c, reading.severity, right, title_y, &style);
-    } else {
-        c.circle(right - 4.0, title_y, 4.0, status_color(reading.severity));
+        paint_chip(c, chip, right, title_y, &style);
+    } else if let Some((_, color)) = chip {
+        c.circle(right - 4.0, title_y, 4.0, color);
     }
+    let chip_word = chip.map(|(word, _)| word.to_string());
     if v.simple {
-        paint_simple_tile(c, v, metric, r, chip_fits, &style);
+        paint_simple_tile(c, v, metric, r, chip_fits, chip_word, &style);
         return;
     }
 
@@ -643,14 +795,14 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
     let wide = r.w > r.h * 2.0;
     let bar = capacity(metric, v.monitor);
     let bar_top = r.bottom() - 15.0;
-    let average = average_text(metric, v.monitor);
+    let details = details(metric, v);
     // With the height for it, the history goes under the number and the row
-    // beside the number is free for the average.
+    // beside the number is free for the details.
     let stacked = wide && bar.is_none() && r.h >= STACKED_MIN_H;
     let note_text = if chip_fits {
         note(metric, v.monitor)
     } else {
-        Some(reading.severity.label().to_string())
+        chip_word
     };
     let note_w = note_text
         .as_deref()
@@ -659,6 +811,19 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
     // A wide tile keeps its note on the title row and gives the row beside the
     // number to the sparkline. Otherwise the note sits level with the number.
     let mut plot_right = right;
+    let stacked_details = stacked
+        .then(|| fit_parts(c, &details, right - number_right - 8.0))
+        .flatten();
+    let beside_number = |text: &str| {
+        c.text(
+            text,
+            (right, baseline),
+            11.0,
+            Weight::Regular,
+            Align::Right,
+            style.ink2,
+        );
+    };
     if let Some(text) = &note_text {
         let chip_gap = if chip_fits && chip_w > 0.0 {
             chip_w + 10.0
@@ -675,36 +840,25 @@ fn paint_tile(c: &Canvas, v: &View, cell: &Cell) {
                 Align::Right,
                 style.ink2,
             );
-            if let Some(average) = average.as_ref().filter(|_| stacked) {
-                let average_w = c.measure(average, 11.0, Weight::Regular);
-                if number_right + 8.0 + average_w <= right {
-                    c.text(
-                        average,
-                        (right, baseline),
-                        11.0,
-                        Weight::Regular,
-                        Align::Right,
-                        style.ink2,
-                    );
-                }
+            if let Some(details) = &stacked_details {
+                beside_number(details);
             }
+        } else if let Some(details) = stacked_details.as_deref().filter(|_| chip_fits) {
+            // The chip has taken the note's place on the title row. The row
+            // beside the number still gives the details, as in any stacked
+            // tile: the gap, or how long a limit held, says more than the peak.
+            beside_number(details);
         } else if number_right + 8.0 + note_w <= right {
-            // A tall tile says both on the one line, if they fit.
-            let both = average
-                .as_ref()
-                .filter(|_| !wide && bar.is_none())
-                .map(|average| format!("{average}  ·  {text}"))
-                .filter(|both| {
-                    number_right + 8.0 + c.measure(both, 11.0, Weight::Regular) <= right
-                });
-            c.text(
-                both.as_deref().unwrap_or(text),
-                (right, baseline),
-                11.0,
-                Weight::Regular,
-                Align::Right,
-                style.ink2,
-            );
+            // A tall tile says as much as fits on the one line, the note last.
+            let both = (!wide && bar.is_none())
+                .then(|| {
+                    let mut parts = details.clone();
+                    parts.push(text.clone());
+                    fit_parts(c, &parts, right - number_right - 8.0)
+                })
+                .flatten()
+                .filter(|both| both.ends_with(text.as_str()));
+            beside_number(both.as_deref().unwrap_or(text));
             if wide {
                 plot_right = right - note_w - 12.0;
             }
@@ -766,6 +920,7 @@ fn paint_simple_tile(
     metric: MetricId,
     r: Rect,
     chip_fits: bool,
+    chip_word: Option<String>,
     style: &Look,
 ) {
     const TITLE_SPACE: f32 = 22.0;
@@ -794,10 +949,13 @@ fn paint_simple_tile(
 
     // The way to a true core reading stays, as nothing else offers it, and so
     // does a status word that didn't fit on the title row.
+    let wide_gap = metric == MetricId::GpuHotspot && v.monitor.gap.view().is_some_and(|g| g.wide);
     let text = if !chip_fits {
-        Some(reading.severity.label().to_string())
+        chip_word
     } else if metric == MetricId::IoDieTemp {
         note(metric, v.monitor)
+    } else if wide_gap {
+        Some("Wide gap".to_string())
     } else {
         None
     };
@@ -817,28 +975,27 @@ fn paint_simple_tile(
 
 const CHIP_DOT_SPACE: f32 = 12.0;
 
-/// The width of a severity chip, which is zero when there is nothing to report.
-fn chip_width(c: &Canvas, severity: Severity) -> f32 {
-    if severity == Severity::Normal {
-        return 0.0;
-    }
-    c.measure(severity.label(), 11.0, Weight::Semibold) + CHIP_DOT_SPACE
+/// The width of a chip, which is zero when there is nothing to report.
+fn chip_width(c: &Canvas, chip: Option<(&str, Color)>) -> f32 {
+    chip.map_or(0.0, |(word, _)| {
+        c.measure(word, 11.0, Weight::Semibold) + CHIP_DOT_SPACE
+    })
 }
 
-/// Draws a severity chip right-aligned at `right`.
-fn paint_chip(c: &Canvas, severity: Severity, right: f32, y: f32, style: &Look) {
-    if severity == Severity::Normal {
+/// Draws a chip right-aligned at `right`.
+fn paint_chip(c: &Canvas, chip: Option<(&str, Color)>, right: f32, y: f32, style: &Look) {
+    let Some((word, color)) = chip else {
         return;
-    }
+    };
     let width = c.text_mid(
-        severity.label(),
+        word,
         (right, y),
         11.0,
         Weight::Semibold,
         Align::Right,
         style.ink,
     );
-    c.circle(right - width - 8.0, y, 4.0, status_color(severity));
+    c.circle(right - width - 8.0, y, 4.0, color);
 }
 
 /// Draws a number and its unit, returning the x position after them.
@@ -954,14 +1111,30 @@ fn paint_spark(c: &Canvas, monitor: &Monitor, metric: MetricId, area: Rect, styl
     if let (Some(other), Some((low, high))) = (companion.and_then(Series::bounds), bounds) {
         bounds = Some((low.min(other.0), high.max(other.1)));
     }
-    let range = domain(scale, bounds);
+    let mut range = domain(scale, bounds);
+    // A wide gap shades the band between hotspot and edge, where there's room.
+    // Space under the edge line keeps that band from filling the whole plot.
+    let wide = companion.is_some() && monitor.gap.view().is_some_and(|g| g.wide);
+    if wide {
+        range.0 -= (range.1 - range.0) * 0.6;
+    }
 
+    let runs = spark_runs(&reading.series, area, range);
     if let Some(series) = companion {
-        for run in spark_runs(series, area, range) {
+        let under = spark_runs(series, area, range);
+        if let (true, true, Some(top), Some(bottom)) =
+            (wide, area.h >= 30.0, runs.last(), under.last())
+        {
+            if top.len() == bottom.len() && top.len() >= 2 {
+                let mut band = top.clone();
+                band.extend(bottom.iter().rev());
+                c.fill_polygon(&band, style.mark.with_alpha(0.16));
+            }
+        }
+        for run in under {
             c.polyline(&run, 1.2, style.ink2.with_alpha(0.6));
         }
     }
-    let runs = spark_runs(&reading.series, area, range);
     for run in &runs {
         c.polyline(run, 2.0, style.mark);
     }
@@ -1089,6 +1262,13 @@ fn strip_entry(item: StripItem, monitor: &Monitor) -> (&'static str, String, Sev
             .map_or("–".to_string(), |v| format!("{v:.0}°"));
         (text, reading.severity)
     };
+    let at_limit = |metric: MetricId| {
+        if limit_on(metric, monitor) == Some(LimitKind::Temperature) {
+            "▾"
+        } else {
+            ""
+        }
+    };
     match item {
         // Without a temperature, the CPU's load is the next most telling number.
         StripItem::Cpu if monitor.absent.contains(MetricId::CpuTemp) => (
@@ -1104,7 +1284,7 @@ fn strip_entry(item: StripItem, monitor: &Monitor) -> (&'static str, String, Sev
                 "I/O"
             };
             let (text, severity) = degrees(metric);
-            (label, text, severity)
+            (label, format!("{text}{}", at_limit(metric)), severity)
         }
         StripItem::Gpu => {
             let (text, severity) = degrees(MetricId::GpuTemp);
@@ -1112,7 +1292,17 @@ fn strip_entry(item: StripItem, monitor: &Monitor) -> (&'static str, String, Sev
         }
         StripItem::Hotspot => {
             let (text, severity) = degrees(MetricId::GpuHotspot);
-            ("Hot", text, severity)
+            let gap = monitor
+                .gap
+                .view()
+                .filter(|g| g.wide)
+                .map(|g| format!(" +{:.0}°", g.degrees))
+                .unwrap_or_default();
+            (
+                "Hot",
+                format!("{text}{}{gap}", at_limit(MetricId::GpuHotspot)),
+                severity,
+            )
         }
         StripItem::Ram => (
             "RAM",
@@ -1557,11 +1747,45 @@ pub fn paint_menu(c: &Canvas, theme: &Theme, plan: &Plan, hover: Option<usize>) 
         theme.track,
     );
     c.fill_round(plan.switch, 6.0, theme.surface);
+    c.fill_round(
+        Rect::new(6.0, plan.ticks_rule_y, plan.width - 12.0, 1.0),
+        0.0,
+        theme.track,
+    );
 
     for (index, item) in plan.items.iter().enumerate() {
         let r = item.rect;
         let y = r.y + r.h / 2.0;
         let hovered = hover == Some(index);
+        if item.action.is_tick() {
+            if hovered {
+                c.fill_round(r, 4.0, theme.track);
+            }
+            let check = Rect::new(r.x + 10.0, y - 7.0, 14.0, 14.0);
+            if item.ticked {
+                c.fill_round(check, 3.0, theme.accent);
+                c.polyline(
+                    &[
+                        (check.x + 3.5, y),
+                        (check.x + 6.0, y + 2.5),
+                        (check.x + 10.5, y - 3.0),
+                    ],
+                    1.6,
+                    WHITE,
+                );
+            } else {
+                c.outline_rect(check, 1.1, theme.ink3);
+            }
+            c.text_mid(
+                item.label,
+                (r.x + 38.0, y),
+                12.0,
+                Weight::Semibold,
+                Align::Left,
+                theme.ink,
+            );
+            continue;
+        }
         if matches!(item.action, Action::Simple | Action::Advanced) {
             if item.ticked {
                 c.fill_round(r, 4.0, theme.track);

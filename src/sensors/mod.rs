@@ -33,6 +33,8 @@ pub struct GpuReading {
     pub fan_percent: Option<f32>,
     pub vram_used_mb: Option<f32>,
     pub clock_mhz: Option<f32>,
+    /// NVIDIA's bit mask of why the clocks are held down.
+    pub limit_reasons: Option<u64>,
 }
 
 /// Where GPU readings come from.
@@ -227,6 +229,7 @@ impl Sources {
         s.set(MetricId::GpuFan, gpu.fan_rpm);
         s.set(MetricId::GpuFanPercent, gpu.fan_percent);
         s.set(MetricId::GpuClock, gpu.clock_mhz.map(|mhz| mhz / 1000.0));
+        s.gpu_limit_reasons = gpu.limit_reasons;
         s.set(
             MetricId::VideoMemory,
             gpu.vram_used_mb.map(|mb| mb / MB_PER_GB),
@@ -245,6 +248,7 @@ impl Sources {
             Some(r) => {
                 s.set(MetricId::CpuTemp, Some(r.temp_c));
                 s.set(MetricId::CpuPower, Some(r.package_w));
+                s.cpu_power_limit = Some(r.limit_w);
             }
             None => s.set(MetricId::CpuPower, self.smoothed_power),
         }

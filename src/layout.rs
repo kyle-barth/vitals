@@ -336,7 +336,11 @@ pub struct Options {
     pub absent: Absent,
     /// The parts on the Specs page, once they have been read.
     pub parts: Vec<PartShape>,
+    /// Something is at a limit, which a large window gives a row of its own.
+    pub limits: bool,
 }
+
+const LIMITS_H: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
@@ -368,6 +372,8 @@ pub struct Layout {
     pub page: Page,
     pub table: Option<Table>,
     pub specs: Option<SpecsPage>,
+    /// The row that says what is at a limit, in a large window.
+    pub limits: Option<Rect>,
 }
 
 /// The Specs page: a band with the copy button, then a row for each part.
@@ -643,6 +649,7 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
         frozen,
         simple,
         absent,
+        limits,
         ..
     } = options;
     let columns = if width >= APP_COLUMNS_W && apps >= 2 {
@@ -650,24 +657,52 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
     } else {
         1
     };
-    for count in (1..=apps.min(MAX_APP_ROWS * columns)).rev() {
+    let large = width >= LARGE_W && height >= LARGE_H;
+    // When room runs short, busy apps keep their rows before the limits row,
+    // because only the busy list can be acted on.
+    let extras: &[bool] = if limits && large {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for count in (0..=apps.min(MAX_APP_ROWS * columns)).rev() {
         let rows = count.div_ceil(columns);
-        let band = rows as f32 * APP_ROW_H + (rows - 1) as f32 * APP_ROW_GAP + GAP;
-        let mut layout = arrange(width, height, band, simple, absent);
-        if layout.mode != Mode::Strip {
-            let cell_w = (width - PAD * 2.0 - GAP * (columns - 1) as f32) / columns as f32;
-            let top = height - PAD - (rows as f32 * (APP_ROW_H + APP_ROW_GAP) - APP_ROW_GAP);
-            layout.app_rows = (0..count)
-                .map(|i| {
-                    let (col, row) = ((i % columns) as f32, (i / columns) as f32);
-                    Rect::new(
-                        PAD + col * (cell_w + GAP),
-                        top + row * (APP_ROW_H + APP_ROW_GAP),
-                        cell_w,
-                        APP_ROW_H,
-                    )
-                })
-                .collect();
+        let busy_band = if count > 0 {
+            rows as f32 * APP_ROW_H + (rows - 1) as f32 * APP_ROW_GAP + GAP
+        } else {
+            0.0
+        };
+        for &with_limits in extras {
+            let band = busy_band + if with_limits { LIMITS_H + GAP } else { 0.0 };
+            let mut layout = arrange(width, height, band, simple, absent);
+            if layout.mode == Mode::Strip {
+                continue;
+            }
+            let mut bottom = height - PAD;
+            if count > 0 {
+                let cell_w = (width - PAD * 2.0 - GAP * (columns - 1) as f32) / columns as f32;
+                let top = bottom - (rows as f32 * (APP_ROW_H + APP_ROW_GAP) - APP_ROW_GAP);
+                layout.app_rows = (0..count)
+                    .map(|i| {
+                        let (col, row) = ((i % columns) as f32, (i / columns) as f32);
+                        Rect::new(
+                            PAD + col * (cell_w + GAP),
+                            top + row * (APP_ROW_H + APP_ROW_GAP),
+                            cell_w,
+                            APP_ROW_H,
+                        )
+                    })
+                    .collect();
+                bottom = top - GAP;
+            }
+            if with_limits {
+                layout.limits = Some(Rect::new(
+                    PAD,
+                    bottom - LIMITS_H,
+                    width - PAD * 2.0,
+                    LIMITS_H,
+                ));
+            }
             return layout;
         }
     }
@@ -726,6 +761,7 @@ fn blank(width: f32, height: f32) -> Layout {
         page: Page::Vitals,
         table: None,
         specs: None,
+        limits: None,
     }
 }
 
@@ -1643,5 +1679,45 @@ mod tests {
         let second = l.app_rows[1];
         assert_eq!(l.app_at(second.x + 5.0, second.y + 5.0), Some(1));
         assert_eq!(l.app_at(20.0, 40.0), None);
+    }
+
+    fn with_limits(width: f32, height: f32, apps: usize) -> Layout {
+        compute(
+            width,
+            height,
+            Options {
+                apps,
+                limits: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_limits_row_only_appears_in_a_large_window() {
+        assert!(with_limits(340.0, 520.0, 0).limits.is_none());
+        let large = with_limits(1240.0, 760.0, 0);
+        assert!(large.limits.is_some());
+        assert!(large.threads.is_some(), "the thread bars stay");
+    }
+
+    #[test]
+    fn the_limits_row_never_overlaps_anything() {
+        for (w, h) in sizes() {
+            for apps in [0, 2] {
+                let l = with_limits(w, h, apps);
+                let mut boxes: Vec<Rect> = l.cells.iter().map(|c| c.rect).collect();
+                boxes.extend(l.threads);
+                boxes.extend(l.app_rows.iter().copied());
+                boxes.extend(l.limits);
+                for (i, a) in boxes.iter().enumerate() {
+                    assert!(a.x >= 0.0 && a.right() <= w + 0.01, "{w}x{h}: {a:?}");
+                    assert!(a.y >= 0.0 && a.bottom() <= h + 0.01, "{w}x{h}: {a:?}");
+                    for b in &boxes[i + 1..] {
+                        assert!(!overlaps(*a, *b), "{w}x{h}: {a:?} and {b:?}");
+                    }
+                }
+            }
+        }
     }
 }

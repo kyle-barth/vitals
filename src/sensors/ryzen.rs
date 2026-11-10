@@ -35,6 +35,8 @@ const BUFFER_LEN: usize = 4096;
 pub struct CoreReading {
     pub temp_c: f32,
     pub package_w: f32,
+    /// The package power limit (PPT), which shows how near the limit it runs.
+    pub limit_w: f32,
 }
 
 /// Decodes AMD's report, rejecting anything that is not physically plausible.
@@ -52,7 +54,11 @@ pub fn parse(report: &[u8]) -> Option<CoreReading> {
         && (0.0..=limit * 1.5).contains(&package_w)
         && (0.2..=2.0).contains(&voltage)
         && (5.0..=125.0).contains(&temp_c);
-    plausible.then_some(CoreReading { temp_c, package_w })
+    plausible.then_some(CoreReading {
+        temp_c,
+        package_w,
+        limit_w: limit,
+    })
 }
 
 type ReadParameters = unsafe extern "C" fn(*mut u8) -> i32;
@@ -119,6 +125,7 @@ mod tests {
         let reading = parse(&report(162.0, 100.07, 1.296, 88.381)).unwrap();
         assert!((reading.temp_c - 88.381).abs() < 0.001);
         assert!((reading.package_w - 100.07).abs() < 0.001);
+        assert!((reading.limit_w - 162.0).abs() < 0.001);
     }
 
     #[test]

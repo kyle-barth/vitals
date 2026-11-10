@@ -50,6 +50,7 @@ type ClockQuery = unsafe extern "C" fn(Device, i32, *mut u32) -> i32;
 type TextQuery = unsafe extern "C" fn(Device, *mut c_char, u32) -> i32;
 type UtilizationQuery = unsafe extern "C" fn(Device, *mut Utilization) -> i32;
 type MemoryQuery = unsafe extern "C" fn(Device, *mut Memory) -> i32;
+type ReasonsQuery = unsafe extern "C" fn(Device, *mut u64) -> i32;
 
 /// Facts about the card that do not change while Vitals runs.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,6 +79,8 @@ pub struct Nvml {
     power: Option<UintQuery>,
     fan: Option<UintQuery>,
     clock: Option<ClockQuery>,
+    /// Why the clocks are held down. Newer drivers renamed the function.
+    reasons: Option<ReasonsQuery>,
 }
 
 // SAFETY: NVML is documented as thread-safe, and the device handle is only a
@@ -142,6 +145,9 @@ impl Nvml {
                 power: symbol(s!("nvmlDeviceGetPowerUsage")).map(|f| transmute(f)),
                 fan: symbol(s!("nvmlDeviceGetFanSpeed")).map(|f| transmute(f)),
                 clock: symbol(s!("nvmlDeviceGetClockInfo")).map(|f| transmute(f)),
+                reasons: symbol(s!("nvmlDeviceGetCurrentClocksEventReasons"))
+                    .or_else(|| symbol(s!("nvmlDeviceGetCurrentClocksThrottleReasons")))
+                    .map(|f| transmute(f)),
             })
         }
     }
@@ -176,6 +182,12 @@ impl Nvml {
             fan_percent: self.uint(self.fan).map(|p| p.min(100) as f32),
             vram_used_mb: memory_ok.then_some(memory.used as f32 / BYTES_PER_MB),
             clock_mhz: clock_ok.then_some(clock as f32),
+            limit_reasons: self.reasons.and_then(|query| {
+                let mut reasons = 0u64;
+                // SAFETY: `reasons` is valid for the call, and the device came
+                // from NVML.
+                (unsafe { query(self.device, &mut reasons) } == SUCCESS).then_some(reasons)
+            }),
             ..GpuReading::default()
         }
     }
