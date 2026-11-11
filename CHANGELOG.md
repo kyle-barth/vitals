@@ -5,6 +5,40 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
+### Changed
+
+- A new look. The CPU, GPU edge and hotspot temperatures lead as big numbers
+  in one framed card, over a chart of the last 2 minutes on a fixed scale with
+  the 110° limit marked. A card of CPU, GPU and memory use, details, network
+  and disk follows. Each part keeps one colour everywhere, text is set in
+  Segoe UI Variable on Windows 11, and the tabs sit in a segmented control.
+- Warnings follow one ladder everywhere: Warm adds an amber chip, Hot turns the
+  number orange and frames the card, and Critical puts a red tile behind the
+  reading.
+- A GPU held at its temperature limit, such as a hotspot at 110°, shows an
+  outlined At limit chip instead of turning red, because cards are built to run
+  there under full load. A CPU at its limit stays Critical.
+- A large window has a chart with an axis, a label at each line's end and a
+  mark from when the hotspot reached its limit, six readings with history
+  beside it, and cards for what needs attention, the GPU and the CPU. Needs
+  attention lists everything that's warm, hot or at a limit in plain words, or
+  the session's peaks when nothing is. It replaces the Limits row.
+- A smaller window names the worst thing under its chart, and +N more opens the
+  large window.
+- The strip has fixed slots that never move: CPU, GPU edge, hotspot and GPU
+  load, with more as it widens. A slot is underlined for Warm, dashed at a
+  limit, outlined for Hot and filled red for Critical. A temperature without a
+  slot, such as VRAM, gets the last one while it needs attention.
+- Simple mode gives up the chart and history lines. In a large window its
+  numbers grow to fill the room.
+
+### Removed
+
+- The 2-minute averages, and the shading between the hotspot and edge lines.
+  The gap itself is still shown.
+
 ## [0.5.0] - 2026-11-10
 
 ### Added
