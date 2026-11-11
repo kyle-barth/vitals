@@ -412,14 +412,6 @@ impl Monitor {
             })
             .max_by_key(|&(_, severity, _)| severity)
     }
-
-    pub fn worst_severity(&self) -> Severity {
-        self.readings
-            .iter()
-            .map(|r| r.severity)
-            .max()
-            .unwrap_or_default()
-    }
 }
 
 #[cfg(test)]

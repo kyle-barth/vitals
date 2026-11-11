@@ -257,6 +257,8 @@ struct App {
     pc_name: Option<String>,
     /// When each alert last sounded, so one reading can't keep repeating.
     alerted: HashMap<String, Instant>,
+    /// Where the summary's link to everything that needs attention was drawn.
+    more_link: Option<layout::Rect>,
 }
 
 /// Where each part sits when the Specs page has two columns: the GPU side of
@@ -292,12 +294,7 @@ impl App {
             sort: self.settings.sort.key,
             absent: self.monitor.absent,
             parts: self.specs.as_ref().map(shapes).unwrap_or_default(),
-            limits: self.limits_shown(),
         }
-    }
-
-    fn limits_shown(&self) -> bool {
-        self.monitor.gpu_limit.shown().is_some() || self.monitor.cpu_limit.shown().is_some()
     }
 
     /// Plays the alert sound for `key`, at most once every 10 minutes each.
@@ -325,7 +322,7 @@ impl App {
             self.options(),
         );
         self.sync_table();
-        if self.layout.specs.is_some() {
+        if self.layout.specs.is_some() || self.layout.large.is_some() {
             self.read_specs();
         }
         self.clamp_scroll();
@@ -499,14 +496,16 @@ impl App {
             copied: self.copied,
             pc_name: self.pc_name.as_deref(),
         };
-        let _ = self.gfx.draw(|canvas| ui::paint(canvas, &view));
+        let mut link = None;
+        let _ = self.gfx.draw(|canvas| link = ui::paint(canvas, &view));
+        self.more_link = link;
     }
 
     /// Takes the newest snapshot from the sampler and updates the display.
     fn on_sample(&mut self) {
         let snapshot = self.latest.lock().ok().and_then(|mut slot| slot.take());
         let Some(snapshot) = snapshot else { return };
-        let before = (self.app_counts(), self.monitor.absent, self.limits_shown());
+        let before = (self.app_counts(), self.monitor.absent);
         let held = self.held_order();
         let severities: Vec<Severity> = ALL
             .iter()
@@ -546,7 +545,7 @@ impl App {
             self.monitor.table = apps::arrange(rows, self.settings.sort, held.as_deref());
             self.clamp_scroll();
         }
-        if (self.app_counts(), self.monitor.absent, self.limits_shown()) != before {
+        if (self.app_counts(), self.monitor.absent) != before {
             self.refresh_layout();
         }
         self.age_app_messages();
@@ -835,6 +834,7 @@ impl App {
                 .specs
                 .as_ref()
                 .is_some_and(|page| page.copy.contains(x, y)),
+            more: self.more_link.is_some_and(|r| r.contains(x, y)),
         }
     }
 
@@ -1019,6 +1019,10 @@ impl App {
             return;
         }
         if self.click_app(x, y) {
+            return;
+        }
+        if self.more_link.is_some_and(|r| r.contains(x, y)) {
+            self.resize_to(Preset::Large.size());
             return;
         }
         let Some(metric) = self.layout.cell_at(x, y) else {
@@ -1402,6 +1406,7 @@ pub fn run(at_sign_in: bool) -> Result<()> {
             copied: None,
             pc_name: std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()),
             alerted: HashMap::new(),
+            more_link: None,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();

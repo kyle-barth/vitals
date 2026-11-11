@@ -84,7 +84,6 @@ impl Specs {
         text.trim_end().to_string()
     }
 
-    #[cfg(test)]
     pub fn part(&self, kind: PartKind) -> Option<&Part> {
         self.parts.iter().find(|p| p.kind == kind)
     }

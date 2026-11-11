@@ -2,28 +2,32 @@
 //! window size can be tested. All values are device-independent pixels.
 //!
 //! The window moves between these modes as it is resized:
-//! - `Strip`: one or two lines of key numbers, with no title bar.
+//! - `Strip`: a row of fixed slots for the key numbers, with no title bar.
 //! - `Rows`: a single column of metric rows, for tall, thin windows.
-//! - `Tiles`: a grid that adds tiles, and enlarges them, as space grows.
+//! - `Compact`: the three temperatures and their history in a framed card,
+//!   then one card of readings, which gives up sections as height runs out.
+//! - `Large`: the same framed card with a full chart, six readings beside it,
+//!   and cards below for what needs attention, the GPU and the CPU.
 //! - `Table`: the Apps page, which shows more columns as width grows.
 //!
 //! Window size decides how many things are shown. Simple mode decides how much
-//! is said about each one, so it never changes which tiles appear.
+//! is said about each one: it gives up the history, never a reading.
 
 use crate::apps::{COLUMNS, SIMPLE_COLUMNS, SortKey};
 use crate::metrics::Absent;
 use crate::metrics::MetricId::{self, *};
 
-pub const TITLE_H: f32 = 28.0;
-pub const PAD: f32 = 8.0;
+pub const TITLE_H: f32 = 38.0;
+/// The margin around each page.
+pub const PAD: f32 = 12.0;
 pub const GAP: f32 = 6.0;
+/// The space between the Vitals page's cards.
+pub const CARD_GAP: f32 = 8.0;
 const ROW_GAP: f32 = 4.0;
-pub const MIN_TILE_H: f32 = 52.0;
 pub const MIN_ROW_H: f32 = 50.0;
 const ROWS_BELOW_WIDTH: f32 = 240.0;
 const LARGE_W: f32 = 820.0;
 const LARGE_H: f32 = 600.0;
-const THREADS_H: f32 = 76.0;
 const APP_ROW_H: f32 = 30.0;
 const APP_ROW_GAP: f32 = 4.0;
 /// From this width, busy apps sit side by side.
@@ -36,24 +40,26 @@ const CONTROL_INSET: f32 = 6.0;
 const END_W: f32 = 40.0;
 const CONFIRM_W: f32 = 46.0;
 const KEEP_W: f32 = 42.0;
-/// The grid must show at least this many tiles, otherwise the strip is better.
-const MIN_TILES: usize = 4;
+/// A column of rows must show at least this many, otherwise the strip is better.
+const MIN_ROWS: usize = 4;
 
 /// Below this width, minimize and maximize step aside for the tabs, and the
 /// tabs and buttons that remain draw closer together.
-const ALL_BUTTONS_W: f32 = 280.0;
+const ALL_BUTTONS_W: f32 = 312.0;
+/// Each tab fits its name in 12px semibold, with 11px either side.
 const TABS: [(Page, f32); 3] = [
-    (Page::Vitals, 46.0),
-    (Page::Apps, 40.0),
-    (Page::Specs, 44.0),
+    (Page::Vitals, 52.0),
+    (Page::Apps, 50.0),
+    (Page::Specs, 53.0),
 ];
 const COMPACT_TABS: [(Page, f32); 3] = [
-    (Page::Vitals, 40.0),
+    (Page::Vitals, 37.0),
     (Page::Apps, 34.0),
-    (Page::Specs, 38.0),
+    (Page::Specs, 39.0),
 ];
-const TABS_X: f32 = 4.0;
-
+/// Where the first tab starts, 2px inside the control that holds them.
+const TABS_X: f32 = 14.0;
+const COMPACT_TABS_X: f32 = 6.0;
 /// The Specs page needs its title bar, its copy band and at least one row.
 const SPECS_MIN_H: f32 = 130.0;
 const SPECS_BAND_H: f32 = 30.0;
@@ -160,53 +166,6 @@ pub fn table_columns(width: f32, simple: bool, sort: SortKey) -> Vec<SortKey> {
     shown
 }
 
-/// Reading order for a two-column grid: CPU on the left, GPU on the right.
-const TILES_2: [MetricId; 12] = [
-    CpuTemp,
-    GpuTemp,
-    Memory,
-    GpuHotspot,
-    CpuLoad,
-    GpuLoad,
-    VideoMemory,
-    VramTemp,
-    CpuPower,
-    GpuPower,
-    Download,
-    GpuFan,
-];
-const TILES_3: [MetricId; 12] = [
-    CpuTemp,
-    GpuTemp,
-    GpuHotspot,
-    Memory,
-    CpuLoad,
-    GpuLoad,
-    VideoMemory,
-    VramTemp,
-    GpuFan,
-    CpuPower,
-    GpuPower,
-    Download,
-];
-const TILES_4: [MetricId; 16] = [
-    CpuTemp,
-    GpuTemp,
-    GpuHotspot,
-    Memory,
-    CpuLoad,
-    GpuLoad,
-    VramTemp,
-    VideoMemory,
-    CpuPower,
-    GpuPower,
-    GpuFan,
-    Download,
-    DiskRead,
-    DiskWrite,
-    CpuClock,
-    Upload,
-];
 const ROWS: [MetricId; 11] = [
     CpuTemp,
     GpuTemp,
@@ -220,6 +179,48 @@ const ROWS: [MetricId; 11] = [
     GpuPower,
     GpuFan,
 ];
+
+/// The three readings at the top of the Vitals page: the CPU, the GPU's edge
+/// and its hotspot. A PC that can't report one gets its nearest stand-in.
+pub fn hero_metrics(absent: Absent) -> [MetricId; 3] {
+    let cpu = if absent.contains(CpuTemp) && absent.contains(IoDieTemp) {
+        CpuLoad
+    } else {
+        CpuTemp
+    };
+    let gpu = if absent.contains(GpuTemp) {
+        GpuLoad
+    } else {
+        GpuTemp
+    };
+    let third = if !absent.contains(GpuHotspot) {
+        GpuHotspot
+    } else if gpu != GpuLoad {
+        GpuLoad
+    } else {
+        Memory
+    };
+    [cpu, gpu, third]
+}
+
+/// The six readings beside a large window's chart, CPU on the left and GPU on
+/// the right, with stand-ins for anything absent or already in the hero.
+fn large_tiles(hero: [MetricId; 3], absent: Absent) -> [MetricId; 6] {
+    const WANTED: [MetricId; 6] = [CpuLoad, GpuLoad, CpuPower, GpuPower, Memory, VideoMemory];
+    const CPU_SPARES: [MetricId; 4] = [CpuClock, DiskRead, Download, DiskWrite];
+    const GPU_SPARES: [MetricId; 5] = [GpuClock, GpuFan, GpuFanPercent, Upload, DiskWrite];
+    let mut shown: Vec<MetricId> = Vec::with_capacity(6);
+    for (i, &metric) in WANTED.iter().enumerate() {
+        let free = |m: &MetricId| !absent.contains(*m) && !hero.contains(m) && !shown.contains(m);
+        let spares: &[MetricId] = if i % 2 == 0 { &CPU_SPARES } else { &GPU_SPARES };
+        let pick = std::iter::once(metric)
+            .chain(spares.iter().copied())
+            .find(free)
+            .unwrap_or(metric);
+        shown.push(pick);
+    }
+    [shown[0], shown[1], shown[2], shown[3], shown[4], shown[5]]
+}
 
 /// Readings that fill the gap left by something this PC cannot report, in the
 /// order they are used.
@@ -297,7 +298,8 @@ impl Rect {
 pub enum Mode {
     Strip,
     Rows,
-    Tiles,
+    Compact,
+    Large,
     Table,
     Specs,
 }
@@ -336,12 +338,9 @@ pub struct Options {
     pub absent: Absent,
     /// The parts on the Specs page, once they have been read.
     pub parts: Vec<PartShape>,
-    /// Something is at a limit, which a large window gives a row of its own.
-    pub limits: bool,
 }
 
-const LIMITS_H: f32 = 30.0;
-
+/// A reading that can be clicked, and that counts as on screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
     pub metric: MetricId,
@@ -357,13 +356,83 @@ pub enum Button {
     Close,
 }
 
+/// The framed card at the top of the Vitals page, with its three temperatures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hero {
+    pub rect: Rect,
+    pub metrics: [MetricId; 3],
+    /// The left edge of each reading. The readings below line up with them.
+    pub columns: [f32; 3],
+    /// The distance from one reading to the next.
+    pub pitch: f32,
+    /// The size of the big numbers.
+    pub number: f32,
+    /// The baseline of the readings' names.
+    pub label_y: f32,
+}
+
+impl Hero {
+    /// The baseline of the big numbers.
+    pub fn number_y(&self) -> f32 {
+        (self.label_y + 8.0 + self.number * 0.74).round()
+    }
+}
+
+/// A part of the readings card in a compact window, top to bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    /// CPU, GPU and memory use, side by side.
+    Stats,
+    /// Three detail rows, such as the VRAM's temperature.
+    Details,
+    /// Network and disk.
+    Io,
+}
+
+impl Section {
+    pub const fn height(self) -> f32 {
+        match self {
+            Section::Stats => 86.0,
+            Section::Details => 102.0,
+            Section::Io => 64.0,
+        }
+    }
+}
+
+/// The Vitals page below Large.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Compact {
+    pub hero: Hero,
+    /// The plot of the last two minutes. Its times go in the 15px below it.
+    pub chart: Option<Rect>,
+    /// The baseline of the one-line summary under the chart.
+    pub summary_y: f32,
+    pub card: Option<Rect>,
+    /// The sections that fit in the card, and where each one starts.
+    pub sections: Vec<(Section, f32)>,
+}
+
+/// The Vitals page in a large window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Large {
+    pub hero: Hero,
+    /// The chart, from its axis labels on the left to its end labels on the
+    /// right. Its times go in the 15px below it.
+    pub chart: Option<Rect>,
+    /// Where the hotspot's gap and time at its limit go, right of the readings.
+    pub side_x: f32,
+    pub tiles: [(MetricId, Rect); 6],
+    pub attention: Rect,
+    pub gpu: Rect,
+    pub cpu: Rect,
+}
+
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub width: f32,
     pub height: f32,
     pub mode: Mode,
     pub cells: Vec<Cell>,
-    pub threads: Option<Rect>,
     pub buttons: Vec<(Button, Rect)>,
     /// One row per busy app shown, in the same order as the apps.
     pub app_rows: Vec<Rect>,
@@ -372,8 +441,10 @@ pub struct Layout {
     pub page: Page,
     pub table: Option<Table>,
     pub specs: Option<SpecsPage>,
-    /// The row that says what is at a limit, in a large window.
-    pub limits: Option<Rect>,
+    pub compact: Option<Compact>,
+    pub large: Option<Large>,
+    /// The strip's slots, when the window is a strip.
+    pub strip: Option<StripPlan>,
 }
 
 /// The Specs page: a band with the copy button, then a row for each part.
@@ -640,16 +711,15 @@ fn table(width: f32, height: f32, options: &Options) -> Table {
     }
 }
 
-/// Lays out the Vitals page. The list of busy apps takes room from the tiles, and
-/// gives up rows before tiles would be lost altogether. With no apps, this is the
-/// window as it always is.
+/// Lays out the Vitals page. The list of busy apps takes room from the cards,
+/// and gives up rows before the page would turn into the strip, or a large
+/// window would lose its layout. With no apps, this is the window as it always is.
 fn vitals(width: f32, height: f32, options: Options) -> Layout {
     let Options {
         apps,
         frozen,
         simple,
         absent,
-        limits,
         ..
     } = options;
     let columns = if width >= APP_COLUMNS_W && apps >= 2 {
@@ -657,57 +727,34 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
     } else {
         1
     };
-    let large = width >= LARGE_W && height >= LARGE_H;
-    // When room runs short, busy apps keep their rows before the limits row,
-    // because only the busy list can be acted on.
-    let extras: &[bool] = if limits && large {
-        &[true, false]
-    } else {
-        &[false]
-    };
-    for count in (0..=apps.min(MAX_APP_ROWS * columns)).rev() {
+    let wants_large = width >= LARGE_W && height >= LARGE_H;
+    for count in (1..=apps.min(MAX_APP_ROWS * columns)).rev() {
         let rows = count.div_ceil(columns);
-        let busy_band = if count > 0 {
-            rows as f32 * APP_ROW_H + (rows - 1) as f32 * APP_ROW_GAP + GAP
-        } else {
-            0.0
-        };
-        for &with_limits in extras {
-            let band = busy_band + if with_limits { LIMITS_H + GAP } else { 0.0 };
-            let mut layout = arrange(width, height, band, simple, absent);
-            if layout.mode == Mode::Strip {
-                continue;
-            }
-            let mut bottom = height - PAD;
-            if count > 0 {
-                let cell_w = (width - PAD * 2.0 - GAP * (columns - 1) as f32) / columns as f32;
-                let top = bottom - (rows as f32 * (APP_ROW_H + APP_ROW_GAP) - APP_ROW_GAP);
-                layout.app_rows = (0..count)
-                    .map(|i| {
-                        let (col, row) = ((i % columns) as f32, (i / columns) as f32);
-                        Rect::new(
-                            PAD + col * (cell_w + GAP),
-                            top + row * (APP_ROW_H + APP_ROW_GAP),
-                            cell_w,
-                            APP_ROW_H,
-                        )
-                    })
-                    .collect();
-                bottom = top - GAP;
-            }
-            if with_limits {
-                layout.limits = Some(Rect::new(
-                    PAD,
-                    bottom - LIMITS_H,
-                    width - PAD * 2.0,
-                    LIMITS_H,
-                ));
-            }
-            return layout;
+        let list_h = rows as f32 * APP_ROW_H + (rows - 1) as f32 * APP_ROW_GAP;
+        let mut layout = arrange(width, height, list_h + CARD_GAP, simple, absent);
+        if layout.mode == Mode::Strip || (wants_large && layout.mode != Mode::Large) {
+            continue;
         }
+        let cell_w = (width - PAD * 2.0 - CARD_GAP * (columns - 1) as f32) / columns as f32;
+        let top = height - PAD - list_h;
+        layout.app_rows = (0..count)
+            .map(|i| {
+                let (col, row) = ((i % columns) as f32, (i / columns) as f32);
+                Rect::new(
+                    PAD + col * (cell_w + CARD_GAP),
+                    top + row * (APP_ROW_H + APP_ROW_GAP),
+                    cell_w,
+                    APP_ROW_H,
+                )
+            })
+            .collect();
+        return layout;
     }
     let mut layout = arrange(width, height, 0.0, simple, absent);
-    if layout.mode == Mode::Strip && apps > 0 {
+    if layout.mode != Mode::Strip {
+        return layout;
+    }
+    if apps > 0 {
         if height >= STRIP_TWO_LINES_H {
             let row_h = 26.0;
             layout.app_rows = vec![Rect::new(
@@ -726,6 +773,10 @@ fn vitals(width: f32, height: f32, options: Options) -> Layout {
             )];
             layout.buttons.clear();
         }
+    }
+    if !layout.strip_is_replaced() {
+        let slots_h = layout.app_rows.first().map_or(height, |row| row.y);
+        layout.strip = Some(plan_strip(width, slots_h, absent));
     }
     layout
 }
@@ -754,24 +805,24 @@ fn blank(width: f32, height: f32) -> Layout {
         height,
         mode: Mode::Strip,
         cells: Vec::new(),
-        threads: None,
         buttons: Vec::new(),
         app_rows: Vec::new(),
         tabs: Vec::new(),
         page: Page::Vitals,
         table: None,
         specs: None,
-        limits: None,
+        compact: None,
+        large: None,
+        strip: None,
     }
 }
 
 fn tabs(window_w: f32) -> Vec<(Page, Rect)> {
-    let set = if window_w < ALL_BUTTONS_W {
-        &COMPACT_TABS
+    let (set, mut x) = if window_w < ALL_BUTTONS_W {
+        (&COMPACT_TABS, COMPACT_TABS_X)
     } else {
-        &TABS
+        (&TABS, TABS_X)
     };
-    let mut x = TABS_X;
     set.iter()
         .map(|&(page, width)| {
             let rect = Rect::new(x, 0.0, width, TITLE_H);
@@ -781,46 +832,28 @@ fn tabs(window_w: f32) -> Vec<(Page, Rect)> {
         .collect()
 }
 
+/// `band` is kept free at the bottom, for the list of busy apps.
 fn arrange(width: f32, height: f32, band: f32, simple: bool, absent: Absent) -> Layout {
     let mut layout = blank(width, height);
-    let body = (height - TITLE_H - PAD - band).max(0.0);
+    let bottom = height - PAD - band;
     if width < ROWS_BELOW_WIDTH {
+        let body = (bottom - TITLE_H).max(0.0);
         let order = fill(&ROWS, absent);
         let count = (((body + ROW_GAP) / (MIN_ROW_H + ROW_GAP)).floor() as usize).min(order.len());
-        if count >= MIN_TILES {
+        if count >= MIN_ROWS {
             layout.mode = Mode::Rows;
-            grid(&mut layout, &order[..count], 1, body, ROW_GAP);
+            rows(&mut layout, &order[..count], body);
         }
-    } else {
-        let large = width >= LARGE_W && height >= LARGE_H;
-        let threads = large && !simple;
-        let (order, cols): (&[MetricId], usize) = if width >= LARGE_W {
-            (if large { &TILES_4 } else { &TILES_4[..12] }, 4)
-        } else if width >= 500.0 {
-            (&TILES_3, 3)
-        } else {
-            (&TILES_2, 2)
-        };
-        let order = fill(order, absent);
-        let grid_h = if threads {
-            body - THREADS_H - GAP
-        } else {
-            body
-        };
-        let rows = ((grid_h + GAP) / (MIN_TILE_H + GAP)).floor().max(0.0) as usize;
-        let mut count = order.len().min(rows * cols);
-        // A short last row reads as tiles that failed to load.
-        if count > cols {
-            count -= count % cols;
-        }
-        if count >= MIN_TILES {
-            layout.mode = Mode::Tiles;
-            grid(&mut layout, &order[..count], cols, grid_h, GAP);
-            if threads {
-                let y = TITLE_H + grid_h + GAP;
-                layout.threads = Some(Rect::new(PAD, y, width - PAD * 2.0, THREADS_H));
-            }
-        }
+    } else if let Some((large, cells)) =
+        large(width, bottom, simple, absent).filter(|_| width >= LARGE_W && height >= LARGE_H)
+    {
+        layout.mode = Mode::Large;
+        layout.cells = cells;
+        layout.large = Some(large);
+    } else if let Some((compact, cells)) = compact(width, bottom, simple, absent) {
+        layout.mode = Mode::Compact;
+        layout.cells = cells;
+        layout.compact = Some(compact);
     }
     layout.buttons = buttons(width, layout.mode);
     if layout.mode != Mode::Strip {
@@ -829,24 +862,228 @@ fn arrange(width: f32, height: f32, band: f32, simple: bool, absent: Absent) -> 
     layout
 }
 
-fn grid(layout: &mut Layout, order: &[MetricId], cols: usize, grid_h: f32, gap: f32) {
-    let rows = order.len().div_ceil(cols);
-    let cell_w = (layout.width - PAD * 2.0 - gap * (cols - 1) as f32) / cols as f32;
-    let cell_h = (grid_h - gap * (rows - 1) as f32) / rows as f32;
+fn rows(layout: &mut Layout, order: &[MetricId], body: f32) {
+    let count = order.len() as f32;
+    let row_h = (body - ROW_GAP * (count - 1.0)) / count;
     layout.cells = order
         .iter()
         .enumerate()
         .map(|(i, &metric)| {
-            let (col, row) = ((i % cols) as f32, (i / cols) as f32);
             let rect = Rect::new(
-                PAD + col * (cell_w + gap),
-                TITLE_H + row * (cell_h + gap),
-                cell_w,
-                cell_h,
+                PAD,
+                TITLE_H + i as f32 * (row_h + ROW_GAP),
+                layout.width - PAD * 2.0,
+                row_h,
             );
             Cell { metric, rect }
         })
         .collect();
+}
+
+/// The chart's height in the Medium window. A taller window gives it the extra.
+const CHART_H: f32 = 66.0;
+/// Shorter than this, a chart says too little to be worth its room.
+const CHART_MIN_H: f32 = 40.0;
+/// From the numbers' baseline to the chart.
+const CHART_OFFSET: f32 = 39.0;
+/// From the chart's bottom to the card's: its times, then the summary.
+const CHART_FOOT: f32 = 48.0;
+/// From the numbers' baseline to the card's bottom, with no chart.
+const PLAIN_FOOT: f32 = 58.0;
+
+/// The readings in the compact card's top section: CPU, GPU and memory use,
+/// or a clock where the load is already a big number above.
+pub fn stats_metrics(hero: [MetricId; 3]) -> [MetricId; 3] {
+    let cpu = if hero.contains(&CpuLoad) {
+        CpuClock
+    } else {
+        CpuLoad
+    };
+    let gpu = if hero.contains(&GpuLoad) {
+        GpuClock
+    } else {
+        GpuLoad
+    };
+    [cpu, gpu, Memory]
+}
+
+/// The compact Vitals page, filling down to `bottom`, if there is room for at
+/// least its three temperatures. The readings card gives up its sections from
+/// the bottom, then the chart shrinks, then goes.
+fn compact(width: f32, bottom: f32, simple: bool, absent: Absent) -> Option<(Compact, Vec<Cell>)> {
+    let top = TITLE_H + 4.0;
+    // The readings sit 108px apart in the 340px Medium window, with the last
+    // one 32px narrower, beside the card's edge.
+    let pitch = (width - 16.0) / 3.0;
+    let first = PAD + 12.0;
+    let hero = Hero {
+        rect: Rect::new(PAD, top, width - PAD * 2.0, 0.0),
+        metrics: hero_metrics(absent),
+        columns: [first, first + pitch, first + pitch * 2.0],
+        pitch,
+        number: (pitch * 0.315).round().clamp(24.0, 48.0),
+        label_y: top + 20.0,
+    };
+    let head = hero.number_y() - top;
+    let with_chart = |chart_h: f32| head + CHART_OFFSET + chart_h + CHART_FOOT;
+    let plain = head + PLAIN_FOOT;
+    let room = bottom - top;
+    const ALL: [Section; 3] = [Section::Stats, Section::Details, Section::Io];
+    let card_part = |shown: usize| {
+        let h: f32 = ALL[..shown].iter().map(|s| s.height()).sum();
+        if shown > 0 { CARD_GAP + h } else { 0.0 }
+    };
+    let mut pick: Option<(Option<f32>, usize)> = None;
+    if !simple {
+        pick = (0..=ALL.len()).rev().find_map(|shown| {
+            let spare = room - with_chart(CHART_H) - card_part(shown);
+            (spare >= -0.01).then(|| (Some(CHART_H + spare.max(0.0)), shown))
+        });
+        if pick.is_none() && with_chart(CHART_MIN_H) <= room {
+            pick = Some((Some(room - with_chart(0.0)), 0));
+        }
+    }
+    if pick.is_none() {
+        pick = (0..=ALL.len())
+            .rev()
+            .find(|&shown| plain + card_part(shown) <= room + 0.01)
+            .map(|shown| (None, shown));
+    }
+    let (chart_h, shown) = pick?;
+
+    let hero_h = chart_h.map_or(plain, with_chart);
+    let hero = Hero {
+        rect: Rect {
+            h: hero_h,
+            ..hero.rect
+        },
+        ..hero
+    };
+    let right = hero.rect.right();
+    let chart = chart_h.map(|h| {
+        let x = hero.columns[0];
+        Rect::new(x, hero.number_y() + CHART_OFFSET, right - 20.0 - x, h)
+    });
+    let card_y = hero.rect.bottom() + CARD_GAP;
+    let card =
+        (shown > 0).then(|| Rect::new(PAD, card_y, hero.rect.w, card_part(shown) - CARD_GAP));
+    let mut sections = Vec::new();
+    let mut y = card_y;
+    for section in &ALL[..shown] {
+        sections.push((*section, y));
+        y += section.height();
+    }
+
+    // What can be clicked, and what counts as on screen.
+    let column = |i: usize, y: f32, h: f32, metric: MetricId| {
+        let x = hero.columns[i] - 8.0;
+        Cell {
+            metric,
+            rect: Rect::new(x, y, hero.pitch.min(right - x), h),
+        }
+    };
+    let mut cells: Vec<Cell> = (0..3)
+        .map(|i| column(i, top, hero.number_y() + 30.0 - top, hero.metrics[i]))
+        .collect();
+    for &(section, y) in &sections {
+        match section {
+            Section::Stats => {
+                let stats = stats_metrics(hero.metrics);
+                cells.extend((0..3).map(|i| column(i, y, section.height(), stats[i])));
+            }
+            Section::Details if !absent.contains(VramTemp) => cells.push(Cell {
+                metric: VramTemp,
+                rect: Rect::new(PAD, y + 42.0 - 11.5, hero.rect.w, 23.0),
+            }),
+            _ => {}
+        }
+    }
+    let compact = Compact {
+        summary_y: hero.rect.bottom() - 12.0,
+        hero,
+        chart,
+        card,
+        sections,
+    };
+    Some((compact, cells))
+}
+
+/// The large Vitals page, on a grid of 12 columns with 8px gutters, filling
+/// down to `bottom`. The hero takes 8 columns and the readings beside it 4,
+/// over three cards of 4 columns each.
+fn large(width: f32, bottom: f32, simple: bool, absent: Absent) -> Option<(Large, Vec<Cell>)> {
+    const HERO_MIN_H: f32 = 232.0;
+    let top = TITLE_H + 10.0;
+    let column_w = (width - PAD * 2.0 - CARD_GAP * 11.0) / 12.0;
+    let span = |n: f32| n * column_w + (n - 1.0) * CARD_GAP;
+    let column_x = |i: f32| PAD + i * (column_w + CARD_GAP);
+    let room = bottom - top - CARD_GAP;
+    let lower = (room * 0.468).round().clamp(220.0, 400.0);
+    let hero_h = room - lower;
+    if hero_h < HERO_MIN_H {
+        return None;
+    }
+    // The design is set at 1240px, where the hero is 808px wide.
+    let hero_w = span(8.0);
+    let scale = hero_w / 808.0;
+    let first = PAD + 16.0;
+    let pitch = 180.0 * scale;
+    // Simple mode has no chart, so its numbers grow to fill the card, centred.
+    let (number, label_y) = if simple {
+        let number = (hero_h * 0.3).min(pitch * 0.5).clamp(48.0, 112.0).floor();
+        let block = 45.0 + number * 0.74;
+        (number, (top + (hero_h - block) / 2.0 + 12.0).round())
+    } else {
+        ((48.0 * scale).round().clamp(48.0, 64.0), top + 30.0)
+    };
+    let hero = Hero {
+        rect: Rect::new(PAD, top, hero_w, hero_h),
+        metrics: hero_metrics(absent),
+        columns: [first, first + pitch, first + pitch * 2.0],
+        pitch,
+        number,
+        label_y,
+    };
+    let chart = (!simple).then(|| Rect::new(first, top + 132.0, hero_w - 32.0, hero_h - 172.0));
+    let tile_w = span(2.0);
+    let tile_h = (hero_h - CARD_GAP * 2.0) / 3.0;
+    let metrics = large_tiles(hero.metrics, absent);
+    let tiles: [(MetricId, Rect); 6] = std::array::from_fn(|i| {
+        let x = column_x(8.0) + (i % 2) as f32 * (tile_w + CARD_GAP);
+        let y = top + (i / 2) as f32 * (tile_h + CARD_GAP);
+        (metrics[i], Rect::new(x, y, tile_w, tile_h))
+    });
+    let lower_y = top + hero_h + CARD_GAP;
+    let card = |i: f32| Rect::new(column_x(i), lower_y, span(4.0), lower);
+    let large = Large {
+        side_x: first + 560.0 * scale,
+        chart,
+        tiles,
+        attention: card(0.0),
+        gpu: card(4.0),
+        cpu: card(8.0),
+        hero,
+    };
+    let mut cells: Vec<Cell> = (0..3)
+        .map(|i| Cell {
+            metric: large.hero.metrics[i],
+            rect: Rect::new(
+                large.hero.columns[i] - 10.0,
+                top,
+                pitch,
+                large.hero.number_y() + 30.0 - top,
+            ),
+        })
+        .collect();
+    cells.extend(tiles.iter().map(|&(metric, rect)| Cell { metric, rect }));
+    if !absent.contains(VramTemp) {
+        let gpu = large.gpu;
+        cells.push(Cell {
+            metric: VramTemp,
+            rect: Rect::new(gpu.x, gpu.y + 48.0, gpu.w, 32.0),
+        });
+    }
+    Some((large, cells))
 }
 
 fn buttons(width: f32, mode: Mode) -> Vec<(Button, Rect)> {
@@ -882,83 +1119,82 @@ fn buttons(width: f32, mode: Mode) -> Vec<(Button, Rect)> {
         .collect()
 }
 
-/// One item in the strip.
+/// One slot in the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripItem {
     Cpu,
     Gpu,
     Hotspot,
+    GpuLoad,
+    CpuLoad,
     Ram,
     Vram,
 }
 
+/// The strip: slots of one width that never move, and one kept free at the
+/// right for an alarm about something the strip has no slot for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StripPlan {
+    /// The size of the numbers.
     pub size: f32,
-    pub lines: Vec<Vec<StripItem>>,
+    pub slots: Vec<(StripItem, Rect)>,
+    pub alarm: Rect,
 }
 
-const STRIP_MIN_SIZE: f32 = 14.0;
+const STRIP_MIN_SIZE: f32 = 12.0;
+const STRIP_MAX_SIZE: f32 = 30.0;
+/// Numbers smaller than this give up the fourth slot before shrinking further.
+const STRIP_FOUR_MIN_SIZE: f32 = 20.0;
 const STRIP_TWO_LINES_H: f32 = 64.0;
+const STRIP_SLOT_GAP: f32 = 4.0;
+/// A slot needs this many times its number's size, to fit "110°".
+const SLOT_PER_SIZE: f32 = 2.4;
+const ALARM_PER_SIZE: f32 = 1.55;
+/// The alarm slot is never narrower than this, so "VRAM" always fits.
+const ALARM_MIN_W: f32 = 40.0;
 
-/// Fits the strip into `width`, shrinking the text before dropping anything.
-/// VRAM goes first, then RAM. The temperatures are never dropped, though the
-/// hotspot is left out on a GPU that cannot report it.
-/// `line_width` measures one line of items at a given text size.
-pub fn plan_strip(
-    width: f32,
-    height: f32,
-    absent: Absent,
-    line_width: impl Fn(&[StripItem], f32) -> f32,
-) -> StripPlan {
+/// Fits the strip's slots into `width` and `height`. The temperatures come
+/// first and are never dropped, though the hotspot is left out on a GPU that
+/// cannot report it. A wider strip adds slots; a narrower one shrinks its
+/// numbers to keep four, then keeps three.
+pub fn plan_strip(width: f32, height: f32, absent: Absent) -> StripPlan {
     use StripItem::*;
-    let kept = |items: &[StripItem]| -> Vec<StripItem> {
-        items
-            .iter()
-            .copied()
-            .filter(|i| *i != Hotspot || !absent.contains(GpuHotspot))
-            .collect()
+    let items: Vec<StripItem> = [Cpu, Gpu, Hotspot, GpuLoad, CpuLoad, Ram, Vram]
+        .into_iter()
+        .filter(|i| *i != Hotspot || !absent.contains(GpuHotspot))
+        .collect();
+    let inner = width - STRIP_INSET * 2.0;
+    let fit = |size: f32| {
+        let room = inner - (size * ALARM_PER_SIZE).max(ALARM_MIN_W) - STRIP_SLOT_GAP * 2.0;
+        let count = ((room + STRIP_SLOT_GAP) / (size * SLOT_PER_SIZE + STRIP_SLOT_GAP))
+            .floor()
+            .max(0.0) as usize;
+        (count.min(items.len()), room)
     };
-    let candidates = [
-        kept(&[Cpu, Gpu, Hotspot, Ram, Vram]),
-        kept(&[Cpu, Gpu, Hotspot, Ram]),
-        kept(&[Cpu, Gpu, Hotspot]),
-    ];
-    let two_lines = height >= STRIP_TWO_LINES_H;
-    let line_h = if two_lines { height / 2.0 } else { height };
-    let start = (line_h * 0.46).clamp(STRIP_MIN_SIZE, 26.0);
-    let split = |items: &[StripItem]| -> Vec<Vec<StripItem>> {
-        if two_lines {
-            let processors = items
-                .iter()
-                .take_while(|i| matches!(i, Cpu | Gpu | Hotspot))
-                .count();
-            let (a, b) = items.split_at(processors);
-            [a.to_vec(), b.to_vec()]
-                .into_iter()
-                .filter(|l| !l.is_empty())
-                .collect()
-        } else {
-            vec![items.to_vec()]
-        }
-    };
-    let available = width - PAD * 2.0;
-    for items in &candidates {
-        let lines = split(items);
-        let mut size = start;
-        loop {
-            if lines.iter().all(|l| line_width(l, size) <= available) {
-                return StripPlan { size, lines };
-            }
-            if size <= STRIP_MIN_SIZE {
-                break;
-            }
-            size = (size - 1.0).max(STRIP_MIN_SIZE);
-        }
-    }
+    let start = (height * 0.565)
+        .round()
+        .clamp(STRIP_MIN_SIZE, STRIP_MAX_SIZE);
+    let sizes = || (0..=(start - STRIP_MIN_SIZE) as usize).map(|i| start - i as f32);
+    let size = sizes()
+        .find(|&s| s >= STRIP_FOUR_MIN_SIZE && fit(s).0 >= 4)
+        .or_else(|| sizes().find(|&s| fit(s).0 >= 3))
+        .unwrap_or(STRIP_MIN_SIZE);
+    let (count, room) = fit(size);
+    let count = count.max(3).min(items.len());
+    let slot_w = (room - STRIP_SLOT_GAP * (count - 1) as f32) / count as f32;
+    let slots = items[..count]
+        .iter()
+        .enumerate()
+        .map(|(i, &item)| {
+            let x = STRIP_INSET + i as f32 * (slot_w + STRIP_SLOT_GAP);
+            (item, Rect::new(x, 0.0, slot_w, height))
+        })
+        .collect();
+    let alarm_x = STRIP_INSET + room + STRIP_SLOT_GAP * 2.0;
     StripPlan {
-        size: STRIP_MIN_SIZE,
-        lines: split(&candidates[2]),
+        size,
+        slots,
+        alarm: Rect::new(alarm_x, 0.0, width - STRIP_INSET - alarm_x, height),
     }
 }
 
@@ -1029,58 +1265,20 @@ mod tests {
     }
 
     #[test]
-    fn cells_respect_minimum_height() {
-        for (w, h) in sizes() {
-            let l = plain(w, h);
-            let min = if l.mode == Mode::Rows {
-                MIN_ROW_H
-            } else {
-                MIN_TILE_H
-            };
-            for c in &l.cells {
-                assert!(c.rect.h >= min - 0.01, "{w}x{h} {c:?}");
-            }
-        }
-    }
-
-    #[test]
     fn non_strip_modes_always_lead_with_both_temperatures() {
         for (w, h) in sizes() {
             let l = plain(w, h);
             if l.mode != Mode::Strip {
-                assert!(l.cells.len() >= MIN_TILES, "{w}x{h}");
+                assert!(l.cells.len() >= 3, "{w}x{h}");
                 assert!(l.shows(CpuTemp) && l.shows(GpuTemp), "{w}x{h}");
             }
         }
     }
 
     #[test]
-    fn four_tiles_fit_from_about_146_tall() {
-        assert_eq!(plain(340.0, 146.0).mode, Mode::Tiles);
-        assert_eq!(plain(340.0, 146.0).cells.len(), 4);
-        assert_eq!(plain(340.0, 120.0).mode, Mode::Strip);
-    }
-
-    #[test]
-    fn two_column_grid_keeps_cpu_left_and_gpu_right() {
-        let l = plain(340.0, 470.0);
-        let x = |m: MetricId| l.cells.iter().find(|c| c.metric == m).unwrap().rect.x;
-        assert!(x(CpuTemp) < x(GpuTemp));
-        assert!(x(CpuLoad) < x(GpuLoad));
-        assert!(x(CpuPower) < x(GpuPower));
-    }
-
-    #[test]
     fn default_window_shows_hotspot_and_memory() {
         let l = plain(340.0, 470.0);
-        assert!(l.shows(GpuHotspot) && l.shows(Memory) && l.shows(VideoMemory));
-    }
-
-    #[test]
-    fn small_window_shows_hotspot_and_memory_in_its_first_four() {
-        let l = plain(250.0, 160.0);
-        assert_eq!(l.cells.len(), 4);
-        assert!(l.shows(GpuHotspot) && l.shows(Memory));
+        assert!(l.shows(GpuHotspot) && l.shows(Memory) && l.shows(VramTemp));
     }
 
     #[test]
@@ -1088,15 +1286,6 @@ mod tests {
         let l = plain(190.0, 640.0);
         assert_eq!(l.mode, Mode::Rows);
         assert_eq!(l.cells.len(), 11);
-    }
-
-    #[test]
-    fn large_window_adds_extra_tiles_and_thread_bars() {
-        let l = plain(1240.0, 760.0);
-        assert_eq!(l.cells.len(), 16);
-        assert!(l.shows(Upload) && l.shows(DiskRead));
-        assert!(l.threads.is_some());
-        assert!(plain(1240.0, 400.0).threads.is_none());
     }
 
     #[test]
@@ -1109,53 +1298,6 @@ mod tests {
                 "{w}x{h}"
             );
         }
-    }
-
-    #[test]
-    fn hit_testing_finds_cells_and_buttons() {
-        let l = plain(340.0, 470.0);
-        assert_eq!(l.button_at(335.0, 10.0), Some(Button::Close));
-        assert_eq!(l.cell_at(20.0, 40.0), Some(CpuTemp));
-        assert_eq!(l.cell_at(20.0, 10.0), None);
-    }
-
-    // A stand-in for text measurement: each item is `advance` wide at size 14.
-    fn measured(advance: f32) -> impl Fn(&[StripItem], f32) -> f32 {
-        move |items, size| items.len() as f32 * advance * size / 14.0
-    }
-
-    #[test]
-    fn strip_shrinks_text_before_dropping_anything() {
-        let plan = plan_strip(320.0, 46.0, Absent::default(), measured(60.5));
-        assert_eq!(plan.size, STRIP_MIN_SIZE);
-        assert_eq!(plan.lines[0].len(), 5);
-    }
-
-    #[test]
-    fn strip_drops_vram_then_ram_but_never_temperatures() {
-        use StripItem::*;
-        let dropped_one = plan_strip(320.0, 46.0, Absent::default(), measured(70.0));
-        assert_eq!(dropped_one.lines[0], vec![Cpu, Gpu, Hotspot, Ram]);
-        let dropped_two = plan_strip(240.0, 46.0, Absent::default(), measured(70.0));
-        assert_eq!(dropped_two.lines[0], vec![Cpu, Gpu, Hotspot]);
-        let too_tight = plan_strip(100.0, 46.0, Absent::default(), measured(70.0));
-        assert_eq!(too_tight.lines[0], vec![Cpu, Gpu, Hotspot]);
-    }
-
-    #[test]
-    fn strip_wraps_to_two_lines_when_tall_enough() {
-        let plan = plan_strip(320.0, 70.0, Absent::default(), measured(58.0));
-        assert_eq!(plan.lines.len(), 2);
-    }
-
-    #[test]
-    fn a_gpu_without_a_hotspot_sensor_leaves_it_out_of_the_strip() {
-        use StripItem::*;
-        let absent = Absent::default().with(GpuHotspot);
-        let plan = plan_strip(320.0, 46.0, absent, measured(40.0));
-        assert_eq!(plan.lines[0], vec![Cpu, Gpu, Ram, Vram]);
-        let two = plan_strip(320.0, 70.0, absent, measured(40.0));
-        assert_eq!(two.lines, vec![vec![Cpu, Gpu], vec![Ram, Vram]]);
     }
 
     fn overlaps(a: Rect, b: Rect) -> bool {
@@ -1173,7 +1315,6 @@ mod tests {
             let again = arrange(w, h, 0.0, false, Absent::default());
             assert_eq!(quiet.mode, again.mode, "{w}x{h}");
             assert_eq!(quiet.cells, again.cells, "{w}x{h}");
-            assert_eq!(quiet.threads, again.threads, "{w}x{h}");
         }
     }
 
@@ -1189,9 +1330,6 @@ mod tests {
                         for c in &l.cells {
                             assert!(!overlaps(*row, c.rect), "{w}x{h} {row:?} {c:?}");
                         }
-                        if let Some(threads) = l.threads {
-                            assert!(!overlaps(*row, threads), "{w}x{h} {row:?}");
-                        }
                         for other in &l.app_rows[i + 1..] {
                             assert!(!overlaps(*row, *other), "{w}x{h} {row:?} {other:?}");
                         }
@@ -1202,27 +1340,12 @@ mod tests {
     }
 
     #[test]
-    fn tiles_keep_their_minimum_height_beside_the_list() {
-        for (w, h) in sizes() {
-            let l = with_apps(w, h, 3, false);
-            let min = if l.mode == Mode::Rows {
-                MIN_ROW_H
-            } else {
-                MIN_TILE_H
-            };
-            for c in &l.cells {
-                assert!(c.rect.h >= min - 0.01, "{w}x{h} {c:?}");
-            }
-        }
-    }
-
-    #[test]
     fn the_list_never_costs_the_temperatures_when_tiles_are_showing() {
         for (w, h) in sizes() {
             let l = with_apps(w, h, 3, false);
             if l.mode != Mode::Strip {
                 assert!(l.shows(CpuTemp) && l.shows(GpuTemp), "{w}x{h}");
-                assert!(l.cells.len() >= MIN_TILES, "{w}x{h}");
+                assert!(l.cells.len() >= 3, "{w}x{h}");
             }
         }
     }
@@ -1230,7 +1353,7 @@ mod tests {
     #[test]
     fn the_default_window_shows_two_apps_in_a_single_column() {
         let l = with_apps(340.0, 470.0, 2, false);
-        assert_eq!(l.mode, Mode::Tiles);
+        assert_eq!(l.mode, Mode::Compact);
         assert_eq!(l.app_rows.len(), 2);
         assert_eq!(l.app_rows[0].x, l.app_rows[1].x);
     }
@@ -1290,21 +1413,6 @@ mod tests {
         let (end, keep) = confirm_buttons(row);
         assert!(inside(end) && inside(keep));
         assert!(end.right() <= keep.x);
-    }
-
-    #[test]
-    fn simple_mode_keeps_every_tile_and_gives_up_the_thread_bars() {
-        let options = Options {
-            simple: true,
-            ..Default::default()
-        };
-        for (w, h) in sizes() {
-            let (full, simple) = (plain(w, h), compute(w, h, options.clone()));
-            if full.threads.is_none() {
-                assert_eq!(full.cells.len(), simple.cells.len(), "{w}x{h}");
-            }
-            assert!(simple.threads.is_none(), "{w}x{h}");
-        }
     }
 
     #[test]
@@ -1407,17 +1515,6 @@ mod tests {
         assert_eq!(Preset::matching((254, 661)), None);
     }
 
-    #[test]
-    fn small_is_a_strip_and_large_has_the_thread_bars() {
-        let at = |preset: Preset| {
-            let (w, h) = preset.size();
-            plain(w as f32, h as f32)
-        };
-        assert_eq!(at(Preset::Small).mode, Mode::Strip);
-        assert_eq!(at(Preset::Medium).mode, Mode::Tiles);
-        assert!(at(Preset::Large).threads.is_some());
-    }
-
     const SCREEN: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
 
     #[test]
@@ -1470,9 +1567,7 @@ mod tests {
 
     #[test]
     fn nothing_absent_leaves_every_order_alone() {
-        for order in [&TILES_2[..], &TILES_3, &TILES_4, &ROWS] {
-            assert_eq!(fill(order, Absent::default()), order);
-        }
+        assert_eq!(fill(&ROWS, Absent::default()), ROWS);
     }
 
     #[test]
@@ -1486,42 +1581,13 @@ mod tests {
     }
 
     #[test]
-    fn stand_ins_keep_the_cpu_left_and_the_gpu_right() {
-        let l = on(intel_nvidia(), 340.0, 520.0);
-        let x = |m: MetricId| l.cells.iter().find(|c| c.metric == m).unwrap().rect.x;
-        assert_eq!(l.cells[0].metric, CpuClock);
-        assert!(x(CpuClock) < x(GpuTemp));
-        assert!(x(CpuLoad) < x(GpuLoad));
-        assert!(x(GpuClock) > x(Memory));
-        assert!(l.shows(GpuFanPercent));
-    }
-
-    #[test]
     fn a_stand_in_further_down_moves_up_rather_than_appearing_twice() {
-        let order = fill(&TILES_4, intel_nvidia());
+        let order = fill(&ROWS, intel_nvidia());
         assert_eq!(order[0], CpuClock);
         let mut seen = order.clone();
         seen.sort_by_key(|m| *m as usize);
         seen.dedup();
         assert_eq!(seen.len(), order.len());
-    }
-
-    #[test]
-    fn a_grid_short_of_metrics_never_leaves_a_ragged_last_row() {
-        let absent = intel_nvidia();
-        for (w, h) in sizes() {
-            let l = on(absent, w, h);
-            if l.mode != Mode::Tiles {
-                continue;
-            }
-            let columns = {
-                let mut xs: Vec<i32> = l.cells.iter().map(|c| c.rect.x as i32).collect();
-                xs.sort_unstable();
-                xs.dedup();
-                xs.len()
-            };
-            assert_eq!(l.cells.len() % columns, 0, "{w}x{h}");
-        }
     }
 
     #[test]
@@ -1681,43 +1747,284 @@ mod tests {
         assert_eq!(l.app_at(20.0, 40.0), None);
     }
 
-    fn with_limits(width: f32, height: f32, apps: usize) -> Layout {
-        compute(
-            width,
-            height,
-            Options {
-                apps,
-                limits: true,
-                ..Default::default()
-            },
-        )
+    #[test]
+    fn rows_respect_their_minimum_height() {
+        for (w, h) in sizes() {
+            let l = plain(w, h);
+            if l.mode == Mode::Rows {
+                for c in &l.cells {
+                    assert!(c.rect.h >= MIN_ROW_H - 0.01, "{w}x{h} {c:?}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn the_limits_row_only_appears_in_a_large_window() {
-        assert!(with_limits(340.0, 520.0, 0).limits.is_none());
-        let large = with_limits(1240.0, 760.0, 0);
-        assert!(large.limits.is_some());
-        assert!(large.threads.is_some(), "the thread bars stay");
+    fn the_compact_page_fits_from_about_165_tall() {
+        assert_eq!(plain(340.0, 166.0).mode, Mode::Compact);
+        assert_eq!(plain(340.0, 150.0).mode, Mode::Strip);
     }
 
     #[test]
-    fn the_limits_row_never_overlaps_anything() {
+    fn the_hero_reads_cpu_then_gpu_edge_then_hotspot() {
+        let l = plain(340.0, 520.0);
+        let compact = l.compact.as_ref().unwrap();
+        assert_eq!(compact.hero.metrics, [CpuTemp, GpuTemp, GpuHotspot]);
+        let x = |m: MetricId| l.cells.iter().find(|c| c.metric == m).unwrap().rect.x;
+        assert!(x(CpuTemp) < x(GpuTemp) && x(GpuTemp) < x(GpuHotspot));
+    }
+
+    #[test]
+    fn the_medium_window_matches_the_design() {
+        let l = plain(340.0, 520.0);
+        assert_eq!(l.mode, Mode::Compact);
+        let c = l.compact.unwrap();
+        assert_eq!(c.hero.rect, Rect::new(12.0, 42.0, 316.0, 206.0));
+        assert_eq!(c.hero.columns, [24.0, 132.0, 240.0]);
+        assert_eq!(c.hero.number, 34.0);
+        assert_eq!(c.chart, Some(Rect::new(24.0, 134.0, 284.0, 66.0)));
+        assert_eq!(c.summary_y, 236.0);
+        assert_eq!(c.card, Some(Rect::new(12.0, 256.0, 316.0, 252.0)));
+        let sections: Vec<Section> = c.sections.iter().map(|(s, _)| *s).collect();
+        assert_eq!(sections, [Section::Stats, Section::Details, Section::Io]);
+        assert!(l.cells.iter().any(|c| c.metric == VramTemp));
+    }
+
+    #[test]
+    fn a_taller_window_gives_the_extra_height_to_the_chart() {
+        let tall = plain(340.0, 700.0).compact.unwrap();
+        assert_eq!(tall.chart.unwrap().h, 66.0 + 180.0);
+        assert_eq!(tall.sections.len(), 3);
+    }
+
+    #[test]
+    fn a_shorter_window_gives_up_sections_from_the_bottom_before_the_chart() {
+        let shown = |h: f32| {
+            let c = plain(340.0, h).compact.unwrap();
+            (
+                c.sections.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                c.chart.is_some(),
+            )
+        };
+        assert_eq!(shown(500.0), (vec![Section::Stats, Section::Details], true));
+        assert_eq!(shown(360.0), (vec![Section::Stats], true));
+        assert_eq!(shown(280.0), (vec![], true));
+        assert_eq!(shown(200.0), (vec![], false));
+    }
+
+    #[test]
+    fn simple_mode_keeps_every_reading_and_gives_up_the_history() {
+        let options = Options {
+            simple: true,
+            ..Default::default()
+        };
+        for (w, h) in sizes() {
+            let simple = compute(w, h, options.clone());
+            if let Some(c) = &simple.compact {
+                assert!(c.chart.is_none(), "{w}x{h}");
+            }
+            if let Some(l) = &simple.large {
+                assert!(l.chart.is_none(), "{w}x{h}");
+            }
+            if simple.mode != Mode::Strip {
+                assert!(simple.cells.iter().any(|c| c.metric == CpuTemp), "{w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_cards_stay_inside_the_window_and_apart() {
         for (w, h) in sizes() {
             for apps in [0, 2] {
-                let l = with_limits(w, h, apps);
-                let mut boxes: Vec<Rect> = l.cells.iter().map(|c| c.rect).collect();
-                boxes.extend(l.threads);
+                let l = with_apps(w, h, apps, false);
+                let Some(c) = &l.compact else { continue };
+                let hero = c.hero.rect;
+                assert!(
+                    hero.y >= TITLE_H && hero.right() <= w - PAD + 0.01,
+                    "{w}x{h}"
+                );
+                if let Some(chart) = c.chart {
+                    assert!(
+                        chart.x >= hero.x && chart.right() <= hero.right(),
+                        "{w}x{h}"
+                    );
+                    assert!(chart.bottom() + 15.0 < c.summary_y, "{w}x{h}");
+                }
+                assert!(c.summary_y < hero.bottom(), "{w}x{h}");
+                let mut boxes = vec![hero];
+                boxes.extend(c.card);
                 boxes.extend(l.app_rows.iter().copied());
-                boxes.extend(l.limits);
                 for (i, a) in boxes.iter().enumerate() {
-                    assert!(a.x >= 0.0 && a.right() <= w + 0.01, "{w}x{h}: {a:?}");
-                    assert!(a.y >= 0.0 && a.bottom() <= h + 0.01, "{w}x{h}: {a:?}");
+                    assert!(a.bottom() <= h - PAD + 0.01, "{w}x{h}: {a:?}");
                     for b in &boxes[i + 1..] {
                         assert!(!overlaps(*a, *b), "{w}x{h}: {a:?} and {b:?}");
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_large_window_matches_the_design() {
+        let l = plain(1240.0, 760.0);
+        assert_eq!(l.mode, Mode::Large);
+        let large = l.large.unwrap();
+        assert_eq!(large.hero.rect, Rect::new(12.0, 48.0, 808.0, 368.0));
+        assert_eq!(large.hero.columns, [28.0, 208.0, 388.0]);
+        assert_eq!(large.side_x, 588.0);
+        assert_eq!(large.tiles[0].1.x, 828.0);
+        assert_eq!(large.tiles[1].1.x, 1032.0);
+        assert!((large.tiles[5].1.bottom() - 416.0).abs() < 0.01);
+        assert_eq!(large.attention, Rect::new(12.0, 424.0, 400.0, 324.0));
+        assert_eq!(large.gpu.x, 420.0);
+        assert_eq!(large.cpu.right(), 1228.0);
+        let metrics: Vec<MetricId> = large.tiles.iter().map(|(m, _)| *m).collect();
+        assert_eq!(
+            metrics,
+            [CpuLoad, GpuLoad, CpuPower, GpuPower, Memory, VideoMemory]
+        );
+    }
+
+    #[test]
+    fn large_cards_stay_inside_the_window_and_apart() {
+        for w in (820..=1920).step_by(37) {
+            for h in (600..=1200).step_by(29) {
+                for apps in [0, 3, 6] {
+                    let l = with_apps(w as f32, h as f32, apps, false);
+                    let Some(large) = &l.large else {
+                        panic!("{w}x{h} with {apps} apps is not large");
+                    };
+                    let mut boxes = vec![large.hero.rect, large.attention, large.gpu, large.cpu];
+                    boxes.extend(large.tiles.iter().map(|(_, r)| *r));
+                    boxes.extend(l.app_rows.iter().copied());
+                    for (i, a) in boxes.iter().enumerate() {
+                        assert!(a.x >= PAD - 0.01 && a.right() <= w as f32 - PAD + 0.01);
+                        assert!(a.y >= TITLE_H && a.bottom() <= h as f32 - PAD + 0.01);
+                        for b in &boxes[i + 1..] {
+                            assert!(!overlaps(*a, *b), "{w}x{h}: {a:?} and {b:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hit_testing_finds_cells_and_buttons() {
+        let l = plain(340.0, 520.0);
+        assert_eq!(l.button_at(335.0, 10.0), Some(Button::Close));
+        assert_eq!(l.cell_at(30.0, 70.0), Some(CpuTemp));
+        assert_eq!(l.cell_at(250.0, 70.0), Some(GpuHotspot));
+        assert_eq!(l.cell_at(20.0, 10.0), None);
+    }
+
+    #[test]
+    fn the_default_strip_has_four_slots_and_room_for_an_alarm() {
+        use StripItem::*;
+        let plan = plan_strip(320.0, 46.0, Absent::default());
+        assert_eq!(plan.size, 26.0);
+        let items: Vec<StripItem> = plan.slots.iter().map(|(i, _)| *i).collect();
+        assert_eq!(items, [Cpu, Gpu, Hotspot, GpuLoad]);
+        assert!(plan.alarm.w >= 40.0);
+        let last = plan.slots.last().unwrap().1;
+        assert!(last.right() < plan.alarm.x && plan.alarm.right() <= 316.01);
+    }
+
+    #[test]
+    fn the_small_preset_keeps_the_same_slots() {
+        let short = plan_strip(320.0, 46.0, Absent::default());
+        let small = plan_strip(320.0, 72.0, Absent::default());
+        assert_eq!(small.size, short.size);
+        assert_eq!(small.slots.len(), 4);
+    }
+
+    #[test]
+    fn a_narrow_strip_keeps_the_three_temperatures() {
+        use StripItem::*;
+        let plan = plan_strip(190.0, 46.0, Absent::default());
+        let items: Vec<StripItem> = plan.slots.iter().map(|(i, _)| *i).collect();
+        assert_eq!(items, [Cpu, Gpu, Hotspot]);
+        assert!(plan.size >= 16.0);
+    }
+
+    #[test]
+    fn a_wide_strip_adds_slots() {
+        assert_eq!(plan_strip(800.0, 46.0, Absent::default()).slots.len(), 7);
+    }
+
+    #[test]
+    fn a_gpu_without_a_hotspot_sensor_leaves_it_out_of_the_strip() {
+        use StripItem::*;
+        let absent = Absent::default().with(GpuHotspot);
+        let plan = plan_strip(320.0, 46.0, absent);
+        let items: Vec<StripItem> = plan.slots.iter().map(|(i, _)| *i).collect();
+        assert_eq!(items, [Cpu, Gpu, GpuLoad, CpuLoad]);
+    }
+
+    #[test]
+    fn strip_slots_stay_inside_and_apart_at_every_width() {
+        for w in 190..=1600 {
+            for h in [36.0, 46.0, 63.0] {
+                let plan = plan_strip(w as f32, h, Absent::default());
+                assert!(plan.slots.len() >= 3, "{w}");
+                let mut edge = 0.0;
+                for (_, r) in &plan.slots {
+                    assert!(r.x >= edge && r.w > 0.0, "{w}");
+                    edge = r.right();
+                }
+                assert!(
+                    edge <= plan.alarm.x && plan.alarm.right() <= w as f32,
+                    "{w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn presets_show_the_strip_the_compact_page_and_the_large_page() {
+        let at = |preset: Preset| {
+            let (w, h) = preset.size();
+            plain(w as f32, h as f32)
+        };
+        assert_eq!(at(Preset::Small).mode, Mode::Strip);
+        assert!(at(Preset::Small).strip.is_some());
+        assert_eq!(at(Preset::Medium).mode, Mode::Compact);
+        assert_eq!(at(Preset::Large).mode, Mode::Large);
+    }
+
+    #[test]
+    fn a_large_window_gives_up_busy_rows_before_its_layout() {
+        let l = with_apps(1240.0, 600.0, 6, false);
+        assert_eq!(l.mode, Mode::Large);
+        assert!(!l.app_rows.is_empty());
+    }
+
+    #[test]
+    fn a_pc_without_a_cpu_temperature_leads_with_its_load() {
+        let l = on(intel_nvidia(), 340.0, 520.0);
+        let c = l.compact.as_ref().unwrap();
+        assert_eq!(c.hero.metrics, [CpuLoad, GpuTemp, GpuLoad]);
+        assert_eq!(stats_metrics(c.hero.metrics), [CpuClock, GpuClock, Memory]);
+        let large = on(intel_nvidia(), 1240.0, 760.0).large.unwrap();
+        for (metric, _) in large.tiles {
+            assert!(!intel_nvidia().contains(metric), "{metric:?}");
+            assert!(!large.hero.metrics.contains(&metric), "{metric:?}");
+        }
+    }
+
+    #[test]
+    fn simple_mode_grows_the_large_numbers_into_the_room_the_chart_leaves() {
+        let options = Options {
+            simple: true,
+            ..Default::default()
+        };
+        for (w, h) in [(1240.0, 760.0), (820.0, 600.0), (1920.0, 1040.0)] {
+            let large = compute(w, h, options.clone()).large.unwrap();
+            let hero = &large.hero;
+            assert!(hero.number > 48.0, "{w}x{h}");
+            assert!(hero.label_y - 12.0 > hero.rect.y, "{w}x{h}");
+            assert!(hero.number_y() + 25.0 < hero.rect.bottom(), "{w}x{h}");
+            assert!(hero.number * 2.0 <= hero.pitch + 0.01, "{w}x{h}");
         }
     }
 }

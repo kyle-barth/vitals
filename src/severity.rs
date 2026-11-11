@@ -13,17 +13,6 @@ pub enum Severity {
     Critical,
 }
 
-impl Severity {
-    pub fn label(self) -> &'static str {
-        match self {
-            Severity::Normal => "",
-            Severity::Warm => "Warm",
-            Severity::Hot => "Hot",
-            Severity::Critical => "Critical",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub warm: f32,
