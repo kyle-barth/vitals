@@ -25,6 +25,7 @@ use crate::layout::{
 };
 use crate::menu::{Action, Plan};
 use crate::metrics::{CoreStatus, MetricId, Monitor, Scale, Unit};
+use crate::search::find;
 use crate::severity::Severity;
 use crate::specs::{Part, PartKind, Specs};
 
@@ -208,6 +209,9 @@ pub struct Hover {
     pub copy: bool,
     /// The summary's link to everything that needs attention.
     pub more: bool,
+    /// The Apps tab's search field, and its clear button.
+    pub search: bool,
+    pub search_clear: bool,
 }
 
 pub struct View<'a> {
@@ -232,6 +236,17 @@ pub struct View<'a> {
     /// Whether the last copy worked, while the button is saying so.
     pub copied: Option<bool>,
     pub pc_name: Option<&'a str>,
+    /// What has been typed into the Apps tab's search.
+    pub search: &'a str,
+    /// The search field is focused or holding a search.
+    pub search_active: bool,
+    /// The field has the keyboard, so it shows its caret.
+    pub search_focused: bool,
+    pub search_caret: usize,
+    /// The selected characters, as an ordered range.
+    pub search_selection: Option<(usize, usize)>,
+    /// How many apps there are before the search filters them.
+    pub apps_total: usize,
 }
 
 /// A reading's place on the state ladder, quietest first.
@@ -308,22 +323,32 @@ pub fn alert_text(layout: &Layout, monitor: &Monitor) -> Option<String> {
     Some(format!("{} {:.0}°", metric.alert_name(), value))
 }
 
-/// Paints the window. Returns where the summary's link to the full list of
-/// what needs attention went, if it was drawn.
-pub fn paint(c: &Canvas, v: &View) -> Option<Rect> {
+/// Where painting put the things a click has to find.
+#[derive(Debug, Default)]
+pub struct Painted {
+    /// The summary's link to the full list of what needs attention.
+    pub more: Option<Rect>,
+    /// Each caret position in the search that is on screen, as (position, x).
+    pub search_marks: Vec<(usize, f32)>,
+}
+
+/// Paints the window, and says where the things a click has to find went.
+pub fn paint(c: &Canvas, v: &View) -> Painted {
     if v.layout.mode == Mode::Strip {
         paint_strip(c, v);
-        return None;
+        return Painted::default();
     }
     c.clear(v.theme.surface);
     paint_title_bar(c, v);
     if let Some(table) = &v.layout.table {
-        paint_table(c, v, table);
-        return None;
+        return Painted {
+            more: None,
+            search_marks: paint_table(c, v, table),
+        };
     }
     if let Some(page) = &v.layout.specs {
         paint_specs(c, v, page);
-        return None;
+        return Painted::default();
     }
     let mut more = None;
     if let Some(compact) = &v.layout.compact {
@@ -336,7 +361,10 @@ pub fn paint(c: &Canvas, v: &View) -> Option<Rect> {
         }
     }
     paint_app_rows(c, v, false);
-    more
+    Painted {
+        more,
+        search_marks: Vec::new(),
+    }
 }
 
 /// The limit a reading is at, if it's being shown.
@@ -2935,10 +2963,142 @@ fn paint_heading(c: &Canvas, v: &View, key: SortKey, (x, y): (f32, f32), align: 
     }
 }
 
-fn paint_table(c: &Canvas, v: &View, table: &Table) {
+/// A magnifying glass: a ring and its handle, centred on `(x, y)`.
+fn magnifier(c: &Canvas, (x, y): (f32, f32), ink: Color) {
+    c.outline_circle(x - 1.0, y - 1.0, 4.5, 1.4, ink);
+    c.line((x + 2.3, y + 2.3), (x + 5.0, y + 5.0), 1.6, ink);
+}
+
+/// The search's text, between `left` and `right`, with its selection and
+/// caret. Text too long for the field scrolls to keep the caret in view,
+/// showing the end where it can. Returns each caret position on screen and its x.
+fn paint_search_text(c: &Canvas, v: &View, (left, right): (f32, f32), y: f32) -> Vec<(usize, f32)> {
+    let t = v.theme;
+    let chars: Vec<char> = v.search.chars().collect();
+    let count = chars.len();
+    let width = |from: usize, to: usize| {
+        let part: String = chars[from..to].iter().collect();
+        c.measure(&part, 12.0, Weight::Regular)
+    };
+    let room = right - left;
+    let caret = v.search_caret.min(count);
+    let first = if width(0, count) <= room {
+        0
+    } else {
+        let tail = (0..count)
+            .find(|&from| width(from, count) <= room)
+            .unwrap_or(count);
+        let to_caret = (0..=caret)
+            .find(|&from| width(from, caret) <= room)
+            .unwrap_or(caret);
+        tail.min(to_caret)
+    };
+    let mut last = count;
+    while last > first && width(first, last) > room {
+        last -= 1;
+    }
+    let marks: Vec<(usize, f32)> = (first..=last)
+        .map(|i| (i, left + width(first, i)))
+        .collect();
+    let x_of = |i: usize| left + width(first, i.clamp(first, last));
+    if let Some((from, to)) = v.search_selection {
+        let (a, b) = (x_of(from), x_of(to));
+        if b > a {
+            let tint = t.accent.with_alpha(if t.dark { 0.38 } else { 0.24 });
+            c.fill_round(Rect::new(a, y - 9.0, b - a, 18.0), 2.0, tint);
+        }
+    }
+    let shown: String = chars[first..last].iter().collect();
+    c.text_mid(&shown, (left, y), 12.0, Weight::Regular, Align::Left, t.ink);
+    if v.search_focused && v.search_selection.is_none() && (first..=last).contains(&caret) {
+        let x = x_of(caret).round() + 0.5;
+        c.line((x, y - 7.0), (x, y + 7.0), 1.0, t.accent);
+    }
+    marks
+}
+
+/// The Apps tab's search field. Before a search it says what it is for and
+/// how to reach it from the keyboard. During one it shows the text, a caret,
+/// how many apps match and a button that clears it. Returns each caret
+/// position on screen and its x.
+fn paint_search(c: &Canvas, v: &View, table: &Table) -> Vec<(usize, f32)> {
+    let t = v.theme;
+    let r = table.search;
+    let y = r.y + r.h / 2.0;
+    c.fill_round(r, 8.0, t.raised);
+    if v.search_active {
+        c.stroke_round(r, 8.0, 1.5, t.accent);
+    } else {
+        c.stroke_round(r, 8.0, 1.0, if v.hover.search { t.ink3 } else { t.hair });
+    }
+    let text_x = r.x + 28.0;
+    let typed = !v.search.is_empty();
+    magnifier(c, (r.x + 14.0, y), if typed { t.ink2 } else { t.ink3 });
+    let mut right = r.right() - 8.0;
+    if typed {
+        let clear = table.search_clear();
+        let (cx, cy) = (clear.x + clear.w / 2.0, y);
+        c.circle(
+            cx,
+            cy,
+            8.0,
+            if v.hover.search_clear {
+                t.ink3.with_alpha(0.45)
+            } else {
+                t.track
+            },
+        );
+        c.line((cx - 3.0, cy - 3.0), (cx + 3.0, cy + 3.0), 1.3, t.ink2);
+        c.line((cx + 3.0, cy - 3.0), (cx - 3.0, cy + 3.0), 1.3, t.ink2);
+        let count = format!("{} of {}", v.monitor.table.len(), v.apps_total);
+        let count_w = c.measure(&count, 11.0, Weight::Regular);
+        right = clear.x - 2.0;
+        if right - count_w - 12.0 > text_x + 40.0 {
+            c.text_mid(
+                &count,
+                (right, y),
+                11.0,
+                Weight::Regular,
+                Align::Right,
+                t.ink3,
+            );
+            right -= count_w + 12.0;
+        }
+        return paint_search_text(c, v, (text_x, right - 4.0), y);
+    }
+    if v.search_focused {
+        let x = text_x.round() - 0.5;
+        c.line((x, y - 7.0), (x, y + 7.0), 1.0, t.accent);
+    }
+    let hint_w = c.measure("Ctrl+F", 10.0, Weight::Semibold) + 10.0;
+    let placeholder_w = c.text_mid(
+        "Search apps",
+        (text_x, y),
+        12.0,
+        Weight::Regular,
+        Align::Left,
+        t.ink3,
+    );
+    if !v.search_active && text_x + placeholder_w + 12.0 < right - hint_w {
+        let key = Rect::new(right - hint_w, y - 8.0, hint_w, 16.0);
+        c.stroke_round(key, 4.0, 1.0, t.hair);
+        c.text_mid(
+            "Ctrl+F",
+            (key.x + key.w / 2.0, y),
+            10.0,
+            Weight::Semibold,
+            Align::Center,
+            t.ink3,
+        );
+    }
+    vec![(0, text_x)]
+}
+
+fn paint_table(c: &Canvas, v: &View, table: &Table) -> Vec<(usize, f32)> {
     if let Some(area) = table.summary {
         paint_summary_row(c, v, area);
     }
+    let marks = paint_search(c, v, table);
     let header = table.header;
     let y = header.y + header.h / 2.0;
     paint_heading(
@@ -2959,6 +3119,33 @@ fn paint_table(c: &Canvas, v: &View, table: &Table) {
     );
 
     let rows = &v.monitor.table;
+    if rows.is_empty() && !v.search.is_empty() && v.apps_total > 0 {
+        let middle = table.body.x + table.body.w / 2.0;
+        let query = c.fit(v.search, 12.0, Weight::Semibold, table.body.w - 140.0);
+        let message = c.fit(
+            &format!("No apps match \u{201c}{query}\u{201d}"),
+            12.0,
+            Weight::Semibold,
+            table.body.w - 16.0,
+        );
+        c.text_mid(
+            &message,
+            (middle, table.body.y + 36.0),
+            12.0,
+            Weight::Semibold,
+            Align::Center,
+            v.theme.ink2,
+        );
+        c.text_mid(
+            "Esc clears the search",
+            (middle, table.body.y + 56.0),
+            11.0,
+            Weight::Regular,
+            Align::Center,
+            v.theme.ink3,
+        );
+        return marks;
+    }
     if rows.is_empty() {
         c.text_mid(
             "Reading apps",
@@ -2968,7 +3155,7 @@ fn paint_table(c: &Canvas, v: &View, table: &Table) {
             Align::Center,
             v.theme.ink3,
         );
-        return;
+        return marks;
     }
     for (slot, row) in rows.iter().skip(v.scroll).take(table.visible).enumerate() {
         paint_table_row(c, v, table, row, v.scroll + slot, table.row(slot));
@@ -2987,6 +3174,7 @@ fn paint_table(c: &Canvas, v: &View, table: &Table) {
             v.theme.track,
         );
     }
+    marks
 }
 
 fn paint_table_row(c: &Canvas, v: &View, table: &Table, row: &AppRow, index: usize, r: Rect) {
@@ -3032,6 +3220,23 @@ fn paint_table_row(c: &Canvas, v: &View, table: &Table, row: &AppRow, index: usi
             .as_deref()
             .map_or(0.0, |s| c.measure(s, 10.0, Weight::Regular) + 5.0);
         let name = c.fit(&row.name, 12.0, Weight::Regular, room - suffix_w);
+        if let Some((start, end)) = find(&name, v.search.trim()) {
+            let width = |chars: usize| {
+                let part: String = name.chars().take(chars).collect();
+                c.measure(&part, 12.0, Weight::Regular)
+            };
+            let (left, right) = (width(start), width(end));
+            let tint = if row.frozen {
+                WHITE.with_alpha(0.28)
+            } else {
+                t.accent.with_alpha(if t.dark { 0.24 } else { 0.16 })
+            };
+            c.fill_round(
+                Rect::new(name_x + left - 1.0, y - 8.0, right - left + 2.0, 16.0),
+                3.0,
+                tint,
+            );
+        }
         let name_w = c.text_mid(&name, (name_x, y), 12.0, Weight::Regular, Align::Left, ink);
         if let Some(suffix) = suffix {
             c.text_mid(

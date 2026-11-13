@@ -122,10 +122,11 @@ To keep the window calm:
 ## 📋 Apps view
 
 <p align="center">
-  <img src="docs/images/apps.png" width="460" alt="The Apps tab: a table of apps with columns for CPU, memory, GPU, VRAM and disk, sorted by CPU, with a frozen app in red at the top">
+  <img src="docs/images/apps.png" width="460" alt="The Apps tab: a search field above a table of apps with columns for CPU, memory, GPU, VRAM and disk, sorted by CPU, with a frozen app in red at the top">
 </p>
 
 - 🗂️ **Open it** from the Apps tab, or click a row in the Busy list to see that app in the full list
+- 🔍 **Search** by typing: the list filters to the apps whose name, or exe name, contains what you type, with the match marked in each name. Ctrl+F or a click also puts you in the field, which edits like any text box: Ctrl+A, Shift with the arrows, a drag or a double-click selects, and Ctrl+C, X and V copy, cut and paste. Esc clears it, and so does leaving the tab.
 - ↕️ **Sort** by clicking a heading. Click again to reverse it. Frozen apps always stay on top.
 - 📏 **Narrow windows** show fewer columns. Click the last heading again to move on to the next one.
 - 🎚️ **Simple mode** keeps to CPU and Memory. Advanced shows every column that fits, and each app's process count.

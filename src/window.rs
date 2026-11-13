@@ -30,7 +30,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_ESCAPE,
+    GetKeyState, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_DELETE,
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, Result, w};
@@ -42,6 +43,7 @@ use crate::helper::CoreLink;
 use crate::layout::{self, Button, Layout, Mode, Options, Page, PartShape, Preset, TITLE_H};
 use crate::menu::{self, Action, MenuState, WM_APP_MENU};
 use crate::metrics::{ALL, CoreStatus, MetricId, Monitor};
+use crate::search::Search;
 use crate::sensors::processes::{EndOutcome, end_app};
 use crate::sensors::system::{CpuVendor, cpu_vendor};
 use crate::sensors::{Latest, Sampler};
@@ -60,10 +62,21 @@ const WM_APP_ENDED: u32 = WM_APP + 2;
 const WM_APP_SPECS: u32 = WM_APP + 4;
 /// A copy has been tried. `wparam` is 1 if it worked.
 const WM_APP_COPIED: u32 = WM_APP + 5;
+/// Text from the clipboard is ready to paste into the search.
+const WM_APP_PASTE: u32 = WM_APP + 6;
 const COPIED_TIMER: usize = 1;
 /// How long the copy button says what happened.
 const COPIED_SHOWS_MS: u32 = 2000;
 const KEY_C: usize = 0x43;
+const KEY_A: usize = 0x41;
+const KEY_F: usize = 0x46;
+const KEY_V: usize = 0x56;
+const KEY_X: usize = 0x58;
+/// The left mouse button, in a mouse message's key flags.
+const MK_LEFT: usize = 0x0001;
+/// The characters Backspace and Ctrl+Backspace type.
+const BACKSPACE: usize = 0x08;
+const CTRL_BACKSPACE: usize = 0x7f;
 /// Samples before an unanswered End question goes away by itself.
 const CONFIRM_SAMPLES: u32 = 10;
 /// Samples that a message stays on an app's row.
@@ -111,6 +124,11 @@ enum Deferred {
     /// Emptying the clipboard sends a message to its last owner, which may be
     /// this window.
     Copy(String),
+    /// The same, for text copied out of the search, which says nothing back.
+    CopyQuietly(String),
+    /// Reading the clipboard can wait on another app, which may send to this
+    /// window meanwhile. The text is left in the slot.
+    Paste(Arc<Mutex<Option<String>>>),
     /// One alert sound, and the taskbar button flashing until it's looked at.
     Alert,
 }
@@ -181,6 +199,16 @@ impl Deferred {
                         WPARAM(usize::from(copied)),
                         LPARAM(0),
                     );
+                }
+                Deferred::CopyQuietly(text) => {
+                    let _ = clipboard::set_text(hwnd, &text);
+                }
+                Deferred::Paste(slot) => {
+                    let text = clipboard::get_text(hwnd);
+                    if let (Some(text), Ok(mut slot)) = (text, slot.lock()) {
+                        *slot = Some(text);
+                        let _ = PostMessageW(Some(hwnd), WM_APP_PASTE, WPARAM(0), LPARAM(0));
+                    }
                 }
                 Deferred::Alert => {
                     let _ = MessageBeep(MB_ICONEXCLAMATION);
@@ -259,6 +287,16 @@ struct App {
     alerted: HashMap<String, Instant>,
     /// Where the summary's link to everything that needs attention was drawn.
     more_link: Option<layout::Rect>,
+    /// The Apps tab's search.
+    search: Search,
+    /// Every app, in order, before the search filters them into the table.
+    table_all: Vec<apps::AppRow>,
+    /// Where pasted text waits for the window.
+    pasted: Arc<Mutex<Option<String>>>,
+    /// Where each caret position in the search was drawn, as (position, x).
+    search_marks: Vec<(usize, f32)>,
+    /// The left button went down in the search field and is still held.
+    selecting: bool,
 }
 
 /// Where each part sits when the Specs page has two columns: the GPU side of
@@ -392,6 +430,7 @@ impl App {
             }
         } else if before && !wanted {
             self.monitor.table = Vec::new();
+            self.table_all = Vec::new();
             self.gfx.drop_icons();
         }
     }
@@ -409,6 +448,9 @@ impl App {
 
     fn set_page(&mut self, page: Page) {
         if page != self.settings.page {
+            // A search belongs to one visit to the Apps tab, so an app picked
+            // from the busy list is never hidden by an old one.
+            self.search = Search::default();
             self.settings.page = page;
             self.scroll = 0;
             self.confirm = None;
@@ -417,11 +459,175 @@ impl App {
         }
     }
 
+    /// Fills the table with the apps that match the search.
+    fn apply_search(&mut self) {
+        let search = &self.search;
+        self.monitor.table = self
+            .table_all
+            .iter()
+            .filter(|row| search.matches(row))
+            .cloned()
+            .collect();
+        self.clamp_scroll();
+    }
+
+    /// Updates the table after the search changes, from its first row.
+    fn search_changed(&mut self) {
+        self.scroll = 0;
+        self.confirm = None;
+        self.apply_search();
+        let (x, y) = self.pointer;
+        self.set_hover(self.hover_at(x, y));
+        self.invalidate();
+    }
+
+    /// Handles a character typed on the Apps tab. Returns true if it used it.
+    fn type_char(&mut self, code: usize) -> bool {
+        if self.layout.table.is_none() {
+            return false;
+        }
+        let changed = match code {
+            BACKSPACE => self.search.backspace(false),
+            CTRL_BACKSPACE => self.search.backspace(true),
+            _ => match char::from_u32(code as u32) {
+                Some(c) => self.search.type_char(c),
+                None => false,
+            },
+        };
+        if changed {
+            self.search_changed();
+        }
+        changed
+    }
+
+    /// Handles a key that edits the search or moves around in it: Ctrl+A,
+    /// C, X, V and F, the arrows, Home, End and Delete. Returns true if it
+    /// used the key.
+    fn edit_key(&mut self, key: usize) -> bool {
+        if self.layout.table.is_none() {
+            return false;
+        }
+        let (control, shift) = (control_held(), shift_held());
+        let focused = self.search.is_focused();
+        let changed = match key {
+            KEY_A if control => {
+                self.search.select_all();
+                false
+            }
+            KEY_F if control => {
+                self.search.focus();
+                false
+            }
+            KEY_C if control => {
+                if let Some(text) = self.search.selected_text() {
+                    self.pending.push(Deferred::CopyQuietly(text));
+                }
+                false
+            }
+            KEY_X if control => match self.search.cut() {
+                Some(text) => {
+                    self.pending.push(Deferred::CopyQuietly(text));
+                    true
+                }
+                None => false,
+            },
+            KEY_V if control => {
+                self.pending.push(Deferred::Paste(self.pasted.clone()));
+                false
+            }
+            _ if !focused => return false,
+            _ if key as u16 == VK_LEFT.0 => {
+                self.search.left(control, shift);
+                false
+            }
+            _ if key as u16 == VK_RIGHT.0 => {
+                self.search.right(control, shift);
+                false
+            }
+            _ if key as u16 == VK_HOME.0 => {
+                self.search.home(shift);
+                false
+            }
+            _ if key as u16 == VK_END.0 => {
+                self.search.end(shift);
+                false
+            }
+            _ if key as u16 == VK_DELETE.0 => self.search.delete(control),
+            _ => return false,
+        };
+        if changed {
+            self.search_changed();
+        } else {
+            self.invalidate();
+        }
+        true
+    }
+
+    /// The caret position nearest to `x`, from where the search was drawn.
+    fn caret_at(&self, x: f32) -> usize {
+        self.search_marks
+            .iter()
+            .min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))
+            .map_or(self.search.text().chars().count(), |&(position, _)| {
+                position
+            })
+    }
+
+    /// The left button went down: in the search field, it places the caret,
+    /// or with Shift extends the selection, and starts a drag.
+    fn press_down(&mut self, x: f32, y: f32) {
+        let Some(table) = &self.layout.table else {
+            return;
+        };
+        if !table.search.contains(x, y)
+            || (table.search_clear().contains(x, y) && !self.search.text().is_empty())
+        {
+            return;
+        }
+        let position = self.caret_at(x);
+        self.search.focus();
+        self.search.move_to(position, shift_held());
+        self.selecting = true;
+        self.invalidate();
+    }
+
+    /// The pointer moved with the button held after pressing in the field.
+    fn drag_select(&mut self, x: f32) {
+        let position = self.caret_at(x);
+        if position != self.search.caret() {
+            self.search.move_to(position, true);
+            self.invalidate();
+        }
+    }
+
+    /// A double-click in the search field selects the word under it.
+    fn double_click(&mut self, x: f32, y: f32) {
+        let in_field = self
+            .layout
+            .table
+            .as_ref()
+            .is_some_and(|t| t.search.contains(x, y) && !t.search_clear().contains(x, y));
+        if in_field {
+            self.search.select_word(self.caret_at(x));
+            self.invalidate();
+        }
+    }
+
+    fn on_paste(&mut self) {
+        let text = self.pasted.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(text) = text.filter(|_| self.layout.table.is_some()) {
+            if self.search.paste(&text) {
+                self.search_changed();
+            }
+        }
+    }
+
     fn set_sort(&mut self, sort: Sort) {
         self.settings.sort = sort;
         self.scroll = 0;
-        let rows = std::mem::take(&mut self.monitor.table);
-        self.monitor.table = apps::arrange(rows, sort, None);
+        let rows = std::mem::take(&mut self.table_all);
+        self.table_all = apps::arrange(rows, sort, None);
+        self.apply_search();
         self.refresh_layout();
         self.invalidate();
     }
@@ -495,10 +701,17 @@ impl App {
             specs: self.specs.as_ref(),
             copied: self.copied,
             pc_name: self.pc_name.as_deref(),
+            search: self.search.text(),
+            search_active: self.search.is_active(),
+            search_focused: self.search.is_focused(),
+            search_caret: self.search.caret(),
+            search_selection: self.search.selection(),
+            apps_total: self.table_all.len(),
         };
-        let mut link = None;
-        let _ = self.gfx.draw(|canvas| link = ui::paint(canvas, &view));
-        self.more_link = link;
+        let mut painted = ui::Painted::default();
+        let _ = self.gfx.draw(|canvas| painted = ui::paint(canvas, &view));
+        self.more_link = painted.more;
+        self.search_marks = painted.search_marks;
     }
 
     /// Takes the newest snapshot from the sampler and updates the display.
@@ -542,8 +755,8 @@ impl App {
 
         if !self.monitor.table.is_empty() {
             let rows = std::mem::take(&mut self.monitor.table);
-            self.monitor.table = apps::arrange(rows, self.settings.sort, held.as_deref());
-            self.clamp_scroll();
+            self.table_all = apps::arrange(rows, self.settings.sort, held.as_deref());
+            self.apply_search();
         }
         if (self.app_counts(), self.monitor.absent) != before {
             self.refresh_layout();
@@ -678,6 +891,17 @@ impl App {
         let Some(table) = &self.layout.table else {
             return;
         };
+        if table.search.contains(x, y) {
+            let clear = table.search_clear().contains(x, y) && !self.search.text().is_empty();
+            self.search.focus();
+            if clear {
+                self.search.clear();
+                self.search_changed();
+            }
+            self.invalidate();
+            return;
+        }
+        self.search.blur();
         if let Some(key) = table.header_at(x, y) {
             self.click_heading(key);
             return;
@@ -835,6 +1059,8 @@ impl App {
                 .as_ref()
                 .is_some_and(|page| page.copy.contains(x, y)),
             more: self.more_link.is_some_and(|r| r.contains(x, y)),
+            search: table.is_some_and(|t| t.search.contains(x, y)),
+            search_clear: table.is_some_and(|t| t.search_clear().contains(x, y)),
         }
     }
 
@@ -1063,6 +1289,11 @@ impl App {
     }
 }
 
+fn shift_held() -> bool {
+    // SAFETY: reading a key's state takes no pointers.
+    unsafe { GetKeyState(i32::from(VK_SHIFT.0)) < 0 }
+}
+
 fn control_held() -> bool {
     // SAFETY: this only reads the calling thread's keyboard state.
     unsafe { GetKeyState(i32::from(VK_CONTROL.0)) < 0 }
@@ -1137,6 +1368,7 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
         WM_APP_ENDED => app.on_ended(),
         WM_APP_SPECS => app.on_specs(),
         WM_APP_COPIED => app.on_copied(wparam.0 != 0),
+        WM_APP_PASTE => app.on_paste(),
         WM_TIMER if wparam.0 == COPIED_TIMER => app.on_copied_timer(),
         WM_KEYDOWN if wparam.0 == KEY_C && app.layout.specs.is_some() && control_held() => {
             app.copy_specs();
@@ -1149,6 +1381,28 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
         WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 && app.confirm.is_some() => {
             app.confirm = None;
             app.invalidate();
+        }
+        WM_KEYDOWN
+            if wparam.0 as u16 == VK_ESCAPE.0
+                && app.layout.table.is_some()
+                && app.search.escape() =>
+        {
+            app.search_changed();
+        }
+        WM_KEYDOWN if app.edit_key(wparam.0) => return Some(LRESULT(0)),
+        WM_CHAR if app.type_char(wparam.0) => return Some(LRESULT(0)),
+        WM_SETCURSOR
+            if (lparam.0 & 0xffff) as u32 == HTCLIENT
+                && app.hover.search
+                && !app.hover.search_clear =>
+        {
+            // SAFETY: the I-beam is a shared system cursor, which needs no freeing.
+            unsafe {
+                if let Ok(cursor) = LoadCursorW(None, IDC_IBEAM) {
+                    SetCursor(Some(cursor));
+                }
+            }
+            return Some(LRESULT(1));
         }
         WM_NCCALCSIZE if wparam.0 != 0 => {
             // Claiming the whole window as client area removes the standard
@@ -1212,6 +1466,9 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
                 signed_high(lparam) as f32 / scale,
             );
             app.pointer_moved(x, y, false);
+            if app.selecting && wparam.0 & MK_LEFT != 0 {
+                app.drag_select(x);
+            }
         }
         WM_NCMOUSEMOVE => {
             let (x, y) = app.window_point(signed_low(lparam), signed_high(lparam));
@@ -1222,7 +1479,22 @@ fn handle(app: &mut App, message: u32, wparam: WPARAM, lparam: LPARAM) -> Option
             app.scroll_by(((wparam.0 >> 16) & 0xffff) as i16);
             return Some(LRESULT(0));
         }
+        WM_LBUTTONDOWN => {
+            let scale = app.scale();
+            app.press_down(
+                signed_low(lparam) as f32 / scale,
+                signed_high(lparam) as f32 / scale,
+            );
+        }
+        WM_LBUTTONDBLCLK => {
+            let scale = app.scale();
+            app.double_click(
+                signed_low(lparam) as f32 / scale,
+                signed_high(lparam) as f32 / scale,
+            );
+        }
         WM_LBUTTONUP => {
+            app.selecting = false;
             let scale = app.scale();
             app.click(
                 signed_low(lparam) as f32 / scale,
@@ -1407,6 +1679,11 @@ pub fn run(at_sign_in: bool) -> Result<()> {
             pc_name: std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()),
             alerted: HashMap::new(),
             more_link: None,
+            search: Search::default(),
+            table_all: Vec::new(),
+            pasted: Arc::default(),
+            search_marks: Vec::new(),
+            selecting: false,
         }));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
         (*app).apply_theme();

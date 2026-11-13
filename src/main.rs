@@ -12,6 +12,7 @@ mod insights;
 mod layout;
 mod menu;
 mod metrics;
+mod search;
 mod sensors;
 mod settings;
 mod severity;

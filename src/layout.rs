@@ -78,9 +78,16 @@ pub const SPECS_FACT_H: f32 = 20.0;
 /// Details need room for a label and a value beside the part's own label.
 const SPECS_DETAIL_MIN_W: f32 = 400.0;
 
-const TABLE_MIN_H: f32 = 110.0;
-const TABLE_SUMMARY_MIN_H: f32 = 180.0;
+/// The Apps page needs its title bar, search field, headings and one row.
+const TABLE_MIN_H: f32 = 140.0;
+const TABLE_SUMMARY_MIN_H: f32 = 214.0;
 const TABLE_SUMMARY_H: f32 = 24.0;
+const SEARCH_H: f32 = 30.0;
+/// The space above the search field, and below it.
+const SEARCH_ABOVE: f32 = 2.0;
+const SEARCH_BELOW: f32 = 4.0;
+/// The clear button at the right end of the search field.
+const SEARCH_CLEAR_W: f32 = 28.0;
 const TABLE_HEADER_H: f32 = 24.0;
 const TABLE_ROW_H: f32 = 26.0;
 /// Space inside a row, either side of its content.
@@ -576,6 +583,7 @@ fn specs_page(width: f32, height: f32, parts: &[PartShape], simple: bool) -> Spe
 pub struct Table {
     /// The row of key numbers, when there is room for one.
     pub summary: Option<Rect>,
+    pub search: Rect,
     pub header: Rect,
     pub body: Rect,
     /// Each number column, with the x of its right edge.
@@ -586,6 +594,16 @@ pub struct Table {
 }
 
 impl Table {
+    /// The button that clears the search, at the right end of its field.
+    pub fn search_clear(&self) -> Rect {
+        Rect::new(
+            self.search.right() - SEARCH_CLEAR_W,
+            self.search.y,
+            SEARCH_CLEAR_W,
+            self.search.h,
+        )
+    }
+
     /// Where the `slot`th row on screen goes.
     pub fn row(&self, slot: usize) -> Rect {
         Rect::new(
@@ -686,8 +704,9 @@ fn table(width: f32, height: f32, options: &Options) -> Table {
     let tall = height >= TABLE_SUMMARY_MIN_H;
     let (left, inner) = (PAD, width - PAD * 2.0);
     let summary = tall.then(|| Rect::new(left, TITLE_H, inner, TABLE_SUMMARY_H));
-    let header_y = TITLE_H + if tall { TABLE_SUMMARY_H } else { 0.0 };
-    let header = Rect::new(left, header_y, inner, TABLE_HEADER_H);
+    let search_y = TITLE_H + if tall { TABLE_SUMMARY_H } else { 0.0 } + SEARCH_ABOVE;
+    let search = Rect::new(left, search_y, inner, SEARCH_H);
+    let header = Rect::new(left, search.bottom() + SEARCH_BELOW, inner, TABLE_HEADER_H);
     let top = header.bottom() + 2.0;
     let body = Rect::new(left, top, inner, (height - PAD - top).max(0.0));
 
@@ -703,6 +722,7 @@ fn table(width: f32, height: f32, options: &Options) -> Table {
         .collect();
     Table {
         summary,
+        search,
         header,
         body,
         columns,
@@ -1453,6 +1473,11 @@ mod tests {
             let last = table.row(table.visible - 1);
             assert!(last.bottom() <= h - PAD + 0.01, "{w}x{h}");
             assert!(table.names_end() - table.body.x >= MIN_NAME_W, "{w}x{h}");
+            assert!(table.search.y >= TITLE_H, "{w}x{h}");
+            assert!(table.search.bottom() < table.header.y, "{w}x{h}");
+            if let Some(summary) = table.summary {
+                assert!(summary.bottom() <= table.search.y, "{w}x{h}");
+            }
         }
     }
 
@@ -2026,5 +2051,24 @@ mod tests {
             assert!(hero.number_y() + 25.0 < hero.rect.bottom(), "{w}x{h}");
             assert!(hero.number * 2.0 <= hero.pitch + 0.01, "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn the_search_field_sits_between_the_key_numbers_and_the_headings() {
+        let l = apps_page(340.0, 520.0, false, SortKey::Cpu);
+        let t = l.table.unwrap();
+        assert_eq!(t.summary, Some(Rect::new(12.0, 38.0, 316.0, 24.0)));
+        assert_eq!(t.search, Rect::new(12.0, 64.0, 316.0, 30.0));
+        assert_eq!(t.header.y, 98.0);
+        assert_eq!(t.body.y, 124.0);
+        assert_eq!(t.search_clear().right(), t.search.right());
+    }
+
+    #[test]
+    fn a_short_apps_page_keeps_its_search_and_gives_up_the_key_numbers() {
+        let t = apps_page(340.0, 200.0, false, SortKey::Cpu).table.unwrap();
+        assert!(t.summary.is_none());
+        assert_eq!(t.search.y, TITLE_H + 2.0);
+        assert!(t.visible >= 1);
     }
 }

@@ -5,6 +5,15 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+### Added
+
+- Search on the Apps tab. Typing anywhere on the tab filters the list to the
+  apps whose name or exe name contains the text, and marks the match in each
+  name. The field says how many apps match, and has a button that clears it.
+  Ctrl+F or a click puts you in the field, which edits like any text box:
+  Ctrl+A, Shift with the arrows, a drag or a double-click selects, and Ctrl+C,
+  X and V copy, cut and paste. Esc clears it.
+
 ## [0.6.0] - 2026-11-11
 
 ### Changed
