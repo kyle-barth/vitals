@@ -5,6 +5,8 @@ Notable changes to Vitals are listed here. Version numbers follow
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-13
+
 ### Added
 
 - Search on the Apps tab. Typing anywhere on the tab filters the list to the
